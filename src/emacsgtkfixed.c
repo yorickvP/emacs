@@ -29,6 +29,238 @@ along with GNU Emacs.  If not, see <https://www.gnu.org/licenses/>.  */
 #endif
 #include "emacsgtkfixed.h"
 
+#ifdef HAVE_GTK4
+
+struct _EmacsFixed
+{
+  GtkWidget parent_instance;
+
+  /* The frame whose edit widget this is, or NULL once the frame has
+     been deleted.  */
+  struct frame *f;
+};
+
+struct _EmacsFixedClass
+{
+  GtkWidgetClass parent_class;
+};
+
+G_DEFINE_TYPE (EmacsFixed, emacs_fixed, GTK_TYPE_WIDGET)
+
+/* The position of a child, in logical pixels relative to the
+   EmacsFixed it is placed in.  */
+struct emacs_fixed_position
+{
+  double x, y;
+};
+
+static GQuark emacs_fixed_position_quark;
+
+static void
+emacs_fixed_measure (GtkWidget *widget, GtkOrientation orientation,
+		     int for_size, int *minimum, int *natural,
+		     int *minimum_baseline, int *natural_baseline)
+{
+  struct frame *f = EMACS_FIXED (widget)->f;
+  int min = 1, nat = 1;
+
+  /* Children never affect the size of the widget: scroll bars and
+     child frames are clipped to the frame, as under X.  */
+  if (f && FRAME_LIVE_P (f) && f->output_data.pgtk)
+    {
+      if (orientation == GTK_ORIENTATION_HORIZONTAL)
+	{
+	  min = f->output_data.pgtk->size_hints.min_width;
+	  nat = f->output_data.pgtk->preferred_width;
+	}
+      else
+	{
+	  min = f->output_data.pgtk->size_hints.min_height;
+	  nat = f->output_data.pgtk->preferred_height;
+	}
+    }
+
+  *minimum = max (min, 1);
+  *natural = max (nat, *minimum);
+}
+
+static void
+emacs_fixed_size_allocate (GtkWidget *widget, int width, int height,
+			   int baseline)
+{
+  GtkWidget *child;
+  struct frame *f = EMACS_FIXED (widget)->f;
+
+  for (child = gtk_widget_get_first_child (widget); child;
+       child = gtk_widget_get_next_sibling (child))
+    {
+      struct emacs_fixed_position *pos;
+      GtkRequisition min, nat;
+      int w, h;
+      GskTransform *transform;
+
+      /* Popovers, used for popup menus and tooltip frames, must be
+	 presented by their parent when it is allocated.  */
+      if (GTK_IS_POPOVER (child))
+	{
+	  if (gtk_widget_get_visible (child))
+	    gtk_popover_present (GTK_POPOVER (child));
+	  continue;
+	}
+
+      if (!gtk_widget_should_layout (child))
+	continue;
+
+      pos = g_object_get_qdata (G_OBJECT (child),
+				emacs_fixed_position_quark);
+      gtk_widget_get_preferred_size (child, &min, &nat);
+
+      /* Children are given the size they requested, which is how
+	 Emacs sizes scroll bars and child frames, or else their
+	 natural size.  */
+      gtk_widget_get_size_request (child, &w, &h);
+      w = max (w < 0 ? nat.width : w, min.width);
+      h = max (h < 0 ? nat.height : h, min.height);
+
+      transform = gsk_transform_translate (NULL, &GRAPHENE_POINT_INIT
+					   (pos ? pos->x : 0,
+					    pos ? pos->y : 0));
+      gtk_widget_allocate (child, w, h, -1, transform);
+    }
+
+  if (f && FRAME_LIVE_P (f) && f->output_data.pgtk)
+    pgtk_edit_widget_allocated (f, width, height);
+}
+
+static void
+emacs_fixed_snapshot (GtkWidget *widget, GtkSnapshot *snapshot)
+{
+  GtkWidget *child;
+  struct frame *f = EMACS_FIXED (widget)->f;
+
+  if (f && FRAME_LIVE_P (f) && f->output_data.pgtk)
+    pgtk_snapshot_frame (f, widget, snapshot);
+
+  for (child = gtk_widget_get_first_child (widget); child;
+       child = gtk_widget_get_next_sibling (child))
+    if (!GTK_IS_NATIVE (child))
+      gtk_widget_snapshot_child (widget, child, snapshot);
+}
+
+static void
+emacs_fixed_dispose (GObject *object)
+{
+  GtkWidget *child;
+
+  while ((child = gtk_widget_get_first_child (GTK_WIDGET (object))))
+    gtk_widget_unparent (child);
+
+  EMACS_FIXED (object)->f = NULL;
+  G_OBJECT_CLASS (emacs_fixed_parent_class)->dispose (object);
+}
+
+static void
+emacs_fixed_class_init (EmacsFixedClass *klass)
+{
+  GtkWidgetClass *widget_class = GTK_WIDGET_CLASS (klass);
+  GObjectClass *object_class = G_OBJECT_CLASS (klass);
+
+  object_class->dispose = emacs_fixed_dispose;
+  widget_class->measure = emacs_fixed_measure;
+  widget_class->size_allocate = emacs_fixed_size_allocate;
+  widget_class->snapshot = emacs_fixed_snapshot;
+  gtk_widget_class_set_css_name (widget_class, "emacs-frame");
+  emacs_fixed_position_quark
+    = g_quark_from_static_string ("emacs-fixed-position");
+}
+
+static void
+emacs_fixed_init (EmacsFixed *fixed)
+{
+  GtkWidget *widget = GTK_WIDGET (fixed);
+
+  fixed->f = NULL;
+  gtk_widget_set_focusable (widget, TRUE);
+  gtk_widget_set_hexpand (widget, TRUE);
+  gtk_widget_set_vexpand (widget, TRUE);
+  gtk_widget_set_overflow (widget, GTK_OVERFLOW_HIDDEN);
+}
+
+GtkWidget *
+emacs_fixed_new (struct frame *f)
+{
+  EmacsFixed *fixed = g_object_new (EMACS_TYPE_FIXED, NULL);
+
+  fixed->f = f;
+  return GTK_WIDGET (fixed);
+}
+
+/* Return the frame whose edit widget is FIXED, or NULL if it has been
+   deleted.  */
+
+struct frame *
+emacs_fixed_get_frame (GtkWidget *fixed)
+{
+  return EMACS_FIXED (fixed)->f;
+}
+
+/* Make FIXED the edit widget of F, which can be NULL.  */
+
+void
+emacs_fixed_set_frame (GtkWidget *fixed, struct frame *f)
+{
+  EMACS_FIXED (fixed)->f = f;
+}
+
+/* Place CHILD in FIXED at the logical coordinates X and Y.  */
+
+void
+emacs_fixed_put (GtkWidget *fixed, GtkWidget *child, double x, double y)
+{
+  struct emacs_fixed_position *pos = g_new (struct emacs_fixed_position, 1);
+
+  pos->x = x;
+  pos->y = y;
+  g_object_set_qdata_full (G_OBJECT (child), emacs_fixed_position_quark,
+			   pos, g_free);
+  gtk_widget_set_parent (child, fixed);
+}
+
+/* Move CHILD, a child of FIXED, to the logical coordinates X and
+   Y.  */
+
+void
+emacs_fixed_move (GtkWidget *fixed, GtkWidget *child, double x, double y)
+{
+  struct emacs_fixed_position *pos
+    = g_object_get_qdata (G_OBJECT (child), emacs_fixed_position_quark);
+
+  if (pos && pos->x == x && pos->y == y)
+    return;
+
+  if (!pos)
+    {
+      pos = g_new (struct emacs_fixed_position, 1);
+      g_object_set_qdata_full (G_OBJECT (child), emacs_fixed_position_quark,
+			       pos, g_free);
+    }
+
+  pos->x = x;
+  pos->y = y;
+  gtk_widget_queue_allocate (fixed);
+}
+
+/* Remove CHILD from FIXED.  */
+
+void
+emacs_fixed_remove (GtkWidget *fixed, GtkWidget *child)
+{
+  eassert (gtk_widget_get_parent (child) == fixed);
+  gtk_widget_unparent (child);
+}
+
+#else /* !HAVE_GTK4 */
+
 /* Silence a bogus diagnostic; see GNOME bug 683906.  */
 #if GNUC_PREREQ (4, 7, 0) && ! GLIB_CHECK_VERSION (2, 35, 7)
 # pragma GCC diagnostic push
@@ -208,3 +440,5 @@ XSetWMNormalHints (Display *d, Window w, XSizeHints *hints)
 }
 
 #endif
+
+#endif /* !HAVE_GTK4 */

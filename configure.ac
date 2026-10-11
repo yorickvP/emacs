@@ -572,6 +572,8 @@ AC_ARG_WITH([ns],[AS_HELP_STRING([--with-ns],
 On by default on macOS.])],[],[with_ns=maybe])
 OPTION_DEFAULT_OFF([w32], [use native MS Windows GUI in a Cygwin build])
 OPTION_DEFAULT_OFF([pgtk], [use GTK to support window systems other than X])
+OPTION_DEFAULT_OFF([gtk4], [use GTK 4 instead of GTK 3 for the pure GTK
+(pgtk) build; implies --with-pgtk])
 
 OPTION_DEFAULT_ON([gpm],[don't use -lgpm for mouse support on a GNU/Linux console])
 OPTION_DEFAULT_IFAVAILABLE([dbus],[compile with D-Bus support])
@@ -2657,6 +2659,10 @@ AS_IF([test x"$REALLY_ANDROID" = "xyes"],
     [AC_DEFINE([USER_FULL_NAME], [pw->pw_gecos])],
     [AC_DEFINE([USER_FULL_NAME], [NULL])])])
 
+if test "${with_gtk4}" = "yes"; then
+  with_pgtk=yes
+fi
+
 if test "${with_pgtk}" = "yes"; then
   window_system=pgtk
 fi
@@ -3155,7 +3161,11 @@ dnl use the toolkit if we have gtk, or X11R5 or newer.
   ;;
   pgtk )
     term_header=pgtkterm.h
-    with_gtk3=yes
+    if test "${with_gtk4}" = "yes"; then
+      with_gtk3=no
+    else
+      with_gtk3=yes
+    fi
     USE_X_TOOLKIT=none
     HAVE_PGTK=yes
     AC_DEFINE([HAVE_PGTK], [1], [Define to 1 if you have pure Gtk+-3.])
@@ -3687,7 +3697,27 @@ GTK_OBJ=
 gtk_term_header=$term_header
 check_gtk2=no
 gtk3_pkg_errors=
-if test "${opsys}" != "mingw32"; then
+if test "${opsys}" != "mingw32" && test "${with_gtk4}" = "yes"; then
+  dnl GTK 4 is only supported by the pgtk window system.
+  GLIB_REQUIRED=2.76
+  GTK_REQUIRED=4.14
+  GTK_MODULES="gtk4 >= $GTK_REQUIRED glib-2.0 >= $GLIB_REQUIRED"
+  EMACS_CHECK_MODULES([GTK], [$GTK_MODULES],
+    [pkg_check_gtk=yes], [pkg_check_gtk=no])
+  if test "$pkg_check_gtk" = "no"; then
+    AC_MSG_ERROR([$GTK_PKG_ERRORS])
+  fi
+  AC_DEFINE([HAVE_GTK4], [1], [Define to 1 if using GTK 4.])
+  GTK_OBJ=emacsgtkfixed.o
+  gtk_term_header=gtkutil.h
+  USE_GTK_TOOLKIT="GTK4"
+  if test "x$ac_enable_gtk_deprecation_warnings" = x; then
+    AC_DEFINE([GDK_DISABLE_DEPRECATION_WARNINGS], [1],
+      [Define to 1 to disable GTK+/GDK deprecation warnings.])
+    AC_DEFINE([GLIB_DISABLE_DEPRECATION_WARNINGS], [1],
+      [Define to 1 to disable Glib deprecation warnings.])
+  fi
+elif test "${opsys}" != "mingw32"; then
   if test "${with_gtk3}" = "yes" || test "${with_gtk}" = "yes" || test "$USE_X_TOOLKIT" = "maybe"; then
     GLIB_REQUIRED=2.37.5
     if test "${window_system}" = "x11"; then
@@ -3759,11 +3789,11 @@ if test x"$pkg_check_gtk" = xyes; then
        [[
 	 GtkSettings *gs = 0;
 	 /* Use G_CALLBACK to make sure function pointers can be cast to void *;
-	    strict C prohibits this.  Use gtk_main_iteration to test that the
+	    strict C prohibits this.  Use gtk_widget_get_type to test that the
 	    libraries are there.  */
 	 if (g_signal_handler_find (G_OBJECT (gs), G_SIGNAL_MATCH_FUNC,
 				    0, 0, 0, G_CALLBACK (callback), 0))
-	   gtk_main_iteration ();
+	   gtk_widget_get_type ();
        ]])],
     [emacs_cv_gtk_compiles=yes], [emacs_cv_gtk_compiles=no])])
   if test "${emacs_cv_gtk_compiles}" != "yes"; then
@@ -3775,7 +3805,11 @@ if test x"$pkg_check_gtk" = xyes; then
     C_SWITCH_X_SITE="$C_SWITCH_X_SITE $GTK_CFLAGS"
     HAVE_GTK=yes
     AC_DEFINE([USE_GTK], [1], [Define to 1 if using GTK.])
-    GTK_OBJ="gtkutil.o $GTK_OBJ"
+    if test "${USE_GTK_TOOLKIT}" = "GTK4"; then
+      GTK_OBJ="gtk4util.o $GTK_OBJ"
+    else
+      GTK_OBJ="gtkutil.o $GTK_OBJ"
+    fi
     term_header=$gtk_term_header
     USE_X_TOOLKIT=none
     AC_MSG_WARN([[Your version of Gtk+ will have problems with

@@ -30,6 +30,7 @@ along with GNU Emacs.  If not, see <https://www.gnu.org/licenses/>.  */
    bunch of extra code for no real gain, as PGTK isn't supposed to
    support X11 anyway.  */
 
+#ifndef HAVE_GTK4
 /* Advance declaration of structs.  */
 struct selection_data;
 struct prop_location;
@@ -65,6 +66,8 @@ pgtk_nalloc (ptrdiff_t nitems, ptrdiff_t item_size)
      item at the end instead of just the extra byte GDK sometimes needs.  */
   return xnmalloc (nitems + 1, item_size);
 }
+
+#endif /* !HAVE_GTK4 */
 
 /* From a Lisp_Object, return a suitable frame for selection
    operations.  OBJECT may be a frame, a terminal object, or nil
@@ -116,6 +119,7 @@ frame_for_pgtk_selection (Lisp_Object object)
 #define LOCAL_SELECTION(selection_symbol, dpyinfo)			\
   assq_no_quit (selection_symbol, dpyinfo->terminal->Vselection_alist)
 
+#ifndef HAVE_GTK4
 static GdkAtom
 symbol_to_gdk_atom (Lisp_Object sym)
 {
@@ -232,6 +236,899 @@ pgtk_own_selection (Lisp_Object selection_name, Lisp_Object selection_value,
   unblock_input ();
 }
 
+#endif /* !HAVE_GTK4 */
+
+#ifdef HAVE_GTK4
+
+/* Under GTK 4, selections are implemented with GdkClipboard.  Only the
+   PRIMARY and CLIPBOARD selections exist; drops are read through the
+   pseudo-selection `XdndSelection', which refers to the current drop.
+
+   Data is identified by MIME types, so the targets Emacs uses for text
+   are mapped to and from MIME types.  When Emacs owns a selection, an
+   EmacsContentProvider serves its contents: requests for data are
+   turned into SELECTION_REQUEST_EVENTs, so that the Lisp converters
+   run outside of GTK callbacks, and answered from
+   pgtk_handle_selection_request.  */
+
+static Lisp_Object pgtk_get_local_selection (Lisp_Object, Lisp_Object,
+					     bool, struct pgtk_display_info *);
+
+/* The MIME type of UTF-8 text.  */
+#define PGTK_UTF8_MIME "text/plain;charset=utf-8"
+
+/* The drop being read through `XdndSelection', or NULL.  */
+static GdkDrop *pgtk_current_drop;
+
+void
+pgtk_drop_set_current (GdkDrop *drop)
+{
+  if (pgtk_current_drop)
+    g_object_unref (pgtk_current_drop);
+  pgtk_current_drop = drop ? g_object_ref (drop) : NULL;
+}
+
+/* Return the clipboard for SELECTION on DPYINFO, or NULL if GDK
+   doesn't support it.  */
+
+static GdkClipboard *
+pgtk_selection_clipboard (struct pgtk_display_info *dpyinfo,
+			  Lisp_Object selection)
+{
+  if (EQ (selection, QCLIPBOARD))
+    return gdk_display_get_clipboard (dpyinfo->gdpy);
+  if (EQ (selection, QPRIMARY))
+    return gdk_display_get_primary_clipboard (dpyinfo->gdpy);
+  return NULL;
+}
+
+/* Return the name of SELECTION as a string in static storage, for use
+   in selection events.  */
+
+static const char *
+pgtk_selection_name (Lisp_Object selection)
+{
+  return EQ (selection, QCLIPBOARD) ? "CLIPBOARD" : "PRIMARY";
+}
+
+/* Return whether TARGET is a target for text, whose data can be
+   offered under its own name.  */
+
+static bool
+pgtk_text_target_p (Lisp_Object target)
+{
+  return (EQ (target, QUTF8_STRING) || EQ (target, QSTRING)
+	  || EQ (target, QTEXT) || EQ (target, QCOMPOUND_TEXT));
+}
+
+/* Return the target used to convert a selection for a request for
+   data of MIME_TYPE.  */
+
+static Lisp_Object
+pgtk_mime_type_to_target (const char *mime_type)
+{
+  /* Text without a charset is UTF-8 in practice.  */
+  if (!strcmp (mime_type, PGTK_UTF8_MIME)
+      || !strcmp (mime_type, "text/plain"))
+    return QUTF8_STRING;
+
+  return intern (mime_type);
+}
+
+/* Return the formats under which the targets in the vector TARGETS
+   can be offered to other programs.  */
+
+static GdkContentFormats *
+pgtk_targets_to_formats (Lisp_Object targets)
+{
+  GdkContentFormatsBuilder *builder = gdk_content_formats_builder_new ();
+  ptrdiff_t i;
+
+  if (VECTORP (targets))
+    for (i = 0; i < ASIZE (targets); i++)
+      {
+	Lisp_Object target = AREF (targets, i);
+
+	if (!SYMBOLP (target))
+	  continue;
+
+	if (EQ (target, QUTF8_STRING))
+	  {
+	    gdk_content_formats_builder_add_mime_type (builder,
+						       PGTK_UTF8_MIME);
+	    gdk_content_formats_builder_add_mime_type (builder, "text/plain");
+	  }
+
+	/* Targets that are not MIME types are part of the X selection
+	   protocol, except for those of text.  */
+	if (pgtk_text_target_p (target)
+	    || strchr (SSDATA (SYMBOL_NAME (target)), '/'))
+	  gdk_content_formats_builder_add_mime_type
+	    (builder, SSDATA (SYMBOL_NAME (target)));
+      }
+
+  return gdk_content_formats_builder_free_to_formats (builder);
+}
+
+/* A request for the contents of a selection owned by Emacs.  */
+
+struct pgtk_selection_request
+{
+  /* The task to complete when the data has been written.  */
+  GTask *task;
+
+  /* The stream to write the data to.  */
+  GOutputStream *stream;
+
+  /* The MIME type requested.  */
+  char *mime_type;
+};
+
+void
+pgtk_free_selection_request (struct pgtk_selection_request *request)
+{
+  if (request->task)
+    {
+      g_task_return_new_error (request->task, G_IO_ERROR, G_IO_ERROR_FAILED,
+			       "Emacs could not convert the selection");
+      g_object_unref (request->task);
+    }
+
+  g_object_unref (request->stream);
+  g_free (request->mime_type);
+  xfree (request);
+}
+
+static void
+pgtk_selection_write_done (GObject *source, GAsyncResult *result,
+			   gpointer user_data)
+{
+  GTask *task = user_data;
+  GError *error = NULL;
+
+  if (g_output_stream_write_all_finish (G_OUTPUT_STREAM (source), result,
+					NULL, &error))
+    g_task_return_boolean (task, TRUE);
+  else
+    g_task_return_error (task, error);
+
+  g_object_unref (task);
+}
+
+/* The content provider used for selections owned by Emacs.  */
+
+#define EMACS_TYPE_CONTENT_PROVIDER (emacs_content_provider_get_type ())
+G_DECLARE_FINAL_TYPE (EmacsContentProvider, emacs_content_provider,
+		      EMACS, CONTENT_PROVIDER, GdkContentProvider)
+
+struct _EmacsContentProvider
+{
+  GdkContentProvider parent_instance;
+
+  /* The display the selection belongs to.  */
+  struct pgtk_display_info *dpyinfo;
+
+  /* The formats offered.  */
+  GdkContentFormats *formats;
+
+  /* The name of the selection, in static storage.  */
+  const char *selection;
+
+  /* Whether Emacs replaced this provider with another one, or disowned
+     the selection.  */
+  bool replaced;
+};
+
+G_DEFINE_TYPE (EmacsContentProvider, emacs_content_provider,
+	       GDK_TYPE_CONTENT_PROVIDER)
+
+static GdkContentFormats *
+emacs_content_provider_ref_formats (GdkContentProvider *provider)
+{
+  return gdk_content_formats_ref (EMACS_CONTENT_PROVIDER (provider)->formats);
+}
+
+static void
+emacs_content_provider_write_mime_type_async (GdkContentProvider *provider,
+					      const char *mime_type,
+					      GOutputStream *stream,
+					      int io_priority,
+					      GCancellable *cancellable,
+					      GAsyncReadyCallback callback,
+					      gpointer user_data)
+{
+  EmacsContentProvider *self = EMACS_CONTENT_PROVIDER (provider);
+  struct pgtk_selection_request *request = xmalloc (sizeof *request);
+  union buffered_input_event inev;
+
+  request->task = g_task_new (provider, cancellable, callback, user_data);
+  g_task_set_priority (request->task, io_priority);
+  request->stream = g_object_ref (stream);
+  request->mime_type = g_strdup (mime_type);
+
+  /* Convert the selection when Emacs reads the event.  */
+  EVENT_INIT (inev.ie);
+  inev.sie.kind = SELECTION_REQUEST_EVENT;
+  SELECTION_EVENT_DPYINFO (&inev.sie) = self->dpyinfo;
+  SELECTION_EVENT_SELECTION (&inev.sie) = self->selection;
+  SELECTION_EVENT_REQUEST (&inev.sie) = request;
+  SELECTION_EVENT_TIME (&inev.sie) = GDK_CURRENT_TIME;
+  kbd_buffer_store_buffered_event (&inev, NULL);
+}
+
+static gboolean
+emacs_content_provider_write_mime_type_finish (GdkContentProvider *provider,
+					       GAsyncResult *result,
+					       GError **error)
+{
+  return g_task_propagate_boolean (G_TASK (result), error);
+}
+
+static void
+emacs_content_provider_detach_clipboard (GdkContentProvider *provider,
+					 GdkClipboard *clipboard)
+{
+  EmacsContentProvider *self = EMACS_CONTENT_PROVIDER (provider);
+  union buffered_input_event inev;
+
+  /* Some other program took the selection.  */
+  if (!self->replaced)
+    {
+      EVENT_INIT (inev.ie);
+      inev.sie.kind = SELECTION_CLEAR_EVENT;
+      SELECTION_EVENT_DPYINFO (&inev.sie) = self->dpyinfo;
+      SELECTION_EVENT_SELECTION (&inev.sie) = self->selection;
+      SELECTION_EVENT_REQUEST (&inev.sie) = NULL;
+      SELECTION_EVENT_TIME (&inev.sie) = GDK_CURRENT_TIME;
+      kbd_buffer_store_buffered_event (&inev, NULL);
+    }
+}
+
+static void
+emacs_content_provider_finalize (GObject *object)
+{
+  gdk_content_formats_unref (EMACS_CONTENT_PROVIDER (object)->formats);
+  G_OBJECT_CLASS (emacs_content_provider_parent_class)->finalize (object);
+}
+
+static void
+emacs_content_provider_class_init (EmacsContentProviderClass *klass)
+{
+  GdkContentProviderClass *provider_class
+    = GDK_CONTENT_PROVIDER_CLASS (klass);
+
+  G_OBJECT_CLASS (klass)->finalize = emacs_content_provider_finalize;
+  provider_class->ref_formats = emacs_content_provider_ref_formats;
+  provider_class->write_mime_type_async
+    = emacs_content_provider_write_mime_type_async;
+  provider_class->write_mime_type_finish
+    = emacs_content_provider_write_mime_type_finish;
+  provider_class->detach_clipboard = emacs_content_provider_detach_clipboard;
+}
+
+static void
+emacs_content_provider_init (EmacsContentProvider *self)
+{
+}
+
+/* Stop providing the contents of CLIPBOARD, if Emacs owns it.  */
+
+static void
+pgtk_release_clipboard (GdkClipboard *clipboard)
+{
+  GdkContentProvider *content = gdk_clipboard_get_content (clipboard);
+
+  if (content && EMACS_IS_CONTENT_PROVIDER (content))
+    {
+      EMACS_CONTENT_PROVIDER (content)->replaced = true;
+      gdk_clipboard_set_content (clipboard, NULL);
+    }
+}
+
+/* Do protocol to assert ourself as a selection owner.
+   FRAME shall be the owner; it must be a valid GDK frame.
+   Update the Vselection_alist so that we can reply to later requests for
+   our selection.  */
+
+static void
+pgtk_own_selection (Lisp_Object selection_name, Lisp_Object selection_value,
+		    Lisp_Object frame)
+{
+  struct frame *f = XFRAME (frame);
+  struct pgtk_display_info *dpyinfo = FRAME_DISPLAY_INFO (f);
+  guint32 timestamp = dpyinfo->last_user_time;
+  GdkClipboard *clipboard = pgtk_selection_clipboard (dpyinfo, selection_name);
+  Lisp_Object targets;
+
+  /* Update the local cache */
+  {
+    Lisp_Object selection_data;
+    Lisp_Object prev_value;
+
+    selection_data = list4 (selection_name, selection_value,
+			    INT_TO_INTEGER (timestamp), frame);
+    prev_value = LOCAL_SELECTION (selection_name, dpyinfo);
+
+    tset_selection_alist
+      (dpyinfo->terminal,
+       Fcons (selection_data, dpyinfo->terminal->Vselection_alist));
+
+    /* If we already owned the selection, remove the old selection
+       data.  Don't use Fdelq as that may quit.  */
+    if (!NILP (prev_value))
+      {
+	/* We know it's not the CAR, so it's easy.  */
+	Lisp_Object rest = dpyinfo->terminal->Vselection_alist;
+	for (; CONSP (rest); rest = XCDR (rest))
+	  if (EQ (prev_value, Fcar (XCDR (rest))))
+	    {
+	      XSETCDR (rest, XCDR (XCDR (rest)));
+	      break;
+	    }
+      }
+  }
+
+  /* Selections GDK doesn't know about, such as SECONDARY, are only
+     available within Emacs.  */
+  if (!clipboard)
+    return;
+
+  /* Announce the targets to the display server.  */
+  targets = pgtk_get_local_selection (selection_name, QTARGETS,
+				      true, dpyinfo);
+
+  block_input ();
+  {
+    EmacsContentProvider *provider
+      = g_object_new (EMACS_TYPE_CONTENT_PROVIDER, NULL);
+    GdkContentProvider *old = gdk_clipboard_get_content (clipboard);
+
+    provider->dpyinfo = dpyinfo;
+    provider->formats = pgtk_targets_to_formats (targets);
+    provider->selection = pgtk_selection_name (selection_name);
+
+    if (old && EMACS_IS_CONTENT_PROVIDER (old))
+      EMACS_CONTENT_PROVIDER (old)->replaced = true;
+
+    if (!gdk_clipboard_set_content (clipboard,
+				    GDK_CONTENT_PROVIDER (provider)))
+      {
+	g_object_unref (provider);
+	unblock_input ();
+	signal_error ("Could not assert ownership over selection",
+		      selection_name);
+      }
+
+    g_object_unref (provider);
+  }
+  unblock_input ();
+}
+
+static void
+pgtk_fail_selection_request (void *data)
+{
+  struct pgtk_selection_request **request = data;
+
+  if (*request)
+    pgtk_free_selection_request (*request);
+}
+
+/* Handle a SelectionRequest event EVENT.
+   This is called from keyboard.c when such an event is found in the queue.  */
+
+static void
+pgtk_handle_selection_request (struct selection_input_event *event)
+{
+  struct pgtk_display_info *dpyinfo = SELECTION_EVENT_DPYINFO (event);
+  struct pgtk_selection_request *request = SELECTION_EVENT_REQUEST (event);
+  Lisp_Object selection_symbol = intern (SELECTION_EVENT_SELECTION (event));
+  Lisp_Object target_symbol = pgtk_mime_type_to_target (request->mime_type);
+  Lisp_Object local_selection_data, value;
+  bool success = false;
+  specpdl_ref count = SPECPDL_INDEX ();
+  Lisp_Object alias, tem;
+
+  /* Fail the request if this is exited non-locally.  */
+  record_unwind_protect_ptr (pgtk_fail_selection_request, &request);
+
+  alias = Vpgtk_selection_alias_alist;
+
+  FOR_EACH_TAIL_SAFE (alias)
+    {
+      tem = Qnil;
+
+      if (CONSP (alias))
+	tem = XCAR (alias);
+
+      if (CONSP (tem)
+	  && EQ (XCAR (tem), selection_symbol)
+	  && SYMBOLP (XCDR (tem)))
+	{
+	  selection_symbol = XCDR (tem);
+	  break;
+	}
+    }
+
+  if (!dpyinfo)
+    goto DONE;
+
+  local_selection_data = LOCAL_SELECTION (selection_symbol, dpyinfo);
+
+  /* Decline if we don't own any selections.  */
+  if (NILP (local_selection_data))
+    goto DONE;
+
+  value = pgtk_get_local_selection (selection_symbol, target_symbol,
+				    false, dpyinfo);
+
+  /* Only strings can be sent to other programs.  */
+  if (CONSP (value) && SYMBOLP (XCAR (value)))
+    {
+      value = XCDR (value);
+      if (CONSP (value) && NILP (XCDR (value)))
+	value = XCAR (value);
+    }
+
+  if (STRINGP (value) && SCHARS (value) == SBYTES (value))
+    {
+      GTask *task = request->task;
+      void *data = g_memdup2 (SDATA (value), SBYTES (value));
+
+      /* The data must live until it has been written, which is when
+	 the task is finished.  */
+      g_object_set_data_full (G_OBJECT (task), "emacs-data", data, g_free);
+      request->task = NULL;
+      g_output_stream_write_all_async (request->stream, data,
+				       SBYTES (value),
+				       g_task_get_priority (task),
+				       g_task_get_cancellable (task),
+				       pgtk_selection_write_done, task);
+      success = true;
+    }
+
+ DONE:
+
+  /* Run the `pgtk-sent-selection-functions' abnormal hook.  */
+  if (!NILP (Vpgtk_sent_selection_functions)
+      && !BASE_EQ (Vpgtk_sent_selection_functions, Qunbound))
+    CALLN (Frun_hook_with_args, Qpgtk_sent_selection_functions,
+	   selection_symbol, target_symbol, success ? Qt : Qnil);
+
+  unbind_to (count, Qnil);
+}
+
+/* Handle a SelectionClear event EVENT, which indicates that some
+   client cleared out our previously asserted selection.
+   This is called from keyboard.c when such an event is found in the queue.  */
+
+static void
+pgtk_handle_selection_clear (struct selection_input_event *event)
+{
+  Lisp_Object selection_symbol, local_selection_data;
+  struct pgtk_display_info *dpyinfo = SELECTION_EVENT_DPYINFO (event);
+  GdkClipboard *clipboard;
+  GdkContentProvider *content;
+  Lisp_Object Vselection_alist;
+
+  if (!dpyinfo) return;
+
+  selection_symbol = intern (SELECTION_EVENT_SELECTION (event));
+  local_selection_data = LOCAL_SELECTION (selection_symbol, dpyinfo);
+
+  /* Well, we already believe that we don't own it, so that's just fine.  */
+  if (NILP (local_selection_data)) return;
+
+  /* We have reasserted the selection since this event was generated,
+     so we can disregard it.  */
+  clipboard = pgtk_selection_clipboard (dpyinfo, selection_symbol);
+  content = clipboard ? gdk_clipboard_get_content (clipboard) : NULL;
+  if (content && EMACS_IS_CONTENT_PROVIDER (content))
+    return;
+
+  /* Otherwise, really clear.  Don't use Fdelq as that may quit.  */
+  Vselection_alist = dpyinfo->terminal->Vselection_alist;
+  if (EQ (local_selection_data, CAR (Vselection_alist)))
+    Vselection_alist = XCDR (Vselection_alist);
+  else
+    {
+      Lisp_Object rest;
+      for (rest = Vselection_alist; CONSP (rest); rest = XCDR (rest))
+	if (EQ (local_selection_data, CAR (XCDR (rest))))
+	  {
+	    XSETCDR (rest, XCDR (XCDR (rest)));
+	    break;
+	  }
+    }
+  tset_selection_alist (dpyinfo->terminal, Vselection_alist);
+
+  /* Run the `pgtk-lost-selection-functions' abnormal hook.  */
+  CALLN (Frun_hook_with_args, Qpgtk_lost_selection_functions, selection_symbol);
+
+  redisplay_preserve_echo_area (20);
+}
+
+void
+pgtk_handle_selection_event (struct selection_input_event *event)
+{
+  if (event->kind != SELECTION_REQUEST_EVENT)
+    pgtk_handle_selection_clear (event);
+  else
+    pgtk_handle_selection_request (event);
+}
+
+/* Clear all selections that were made from frame F.
+   We do this when about to delete a frame.  */
+
+void
+pgtk_clear_frame_selections (struct frame *f)
+{
+  Lisp_Object frame, rest, symbol;
+  struct pgtk_display_info *dpyinfo = FRAME_DISPLAY_INFO (f);
+  struct terminal *t = dpyinfo->terminal;
+  GdkClipboard *clipboard;
+
+  XSETFRAME (frame, f);
+
+  /* Delete elements from the beginning of Vselection_alist.  */
+  while (CONSP (t->Vselection_alist)
+	 && EQ (frame, XCAR (XCDR (XCDR (XCDR (XCAR (t->Vselection_alist)))))))
+    {
+      symbol = Fcar (Fcar (t->Vselection_alist));
+
+      /* Run the `pgtk-lost-selection-functions' abnormal hook.  */
+      CALLN (Frun_hook_with_args, Qpgtk_lost_selection_functions,
+	     symbol);
+
+      if ((clipboard = pgtk_selection_clipboard (dpyinfo, symbol)))
+	pgtk_release_clipboard (clipboard);
+
+      tset_selection_alist (t, XCDR (t->Vselection_alist));
+    }
+
+  /* Delete elements after the beginning of Vselection_alist.  */
+  for (rest = t->Vselection_alist; CONSP (rest); rest = XCDR (rest))
+    if (CONSP (XCDR (rest))
+	&& EQ (frame, XCAR (XCDR (XCDR (XCDR (XCAR (XCDR (rest))))))))
+      {
+	symbol = XCAR (XCAR (XCDR (rest)));
+	CALLN (Frun_hook_with_args, Qpgtk_lost_selection_functions,
+	       symbol);
+
+	if ((clipboard = pgtk_selection_clipboard (dpyinfo, symbol)))
+	  pgtk_release_clipboard (clipboard);
+
+	XSETCDR (rest, XCDR (XCDR (rest)));
+	break;
+      }
+}
+
+/* Reading the selections of other programs.  */
+
+/* A cons cell whose car is set to t when the data being read has
+   arrived, and to lambda if reading it failed.  */
+static Lisp_Object reading_selection_reply;
+
+/* The data that has been read, and its MIME type.  */
+static GBytes *reading_selection_data;
+static char *reading_selection_type;
+
+/* The number of the read in progress.  Callbacks for reads that were
+   abandoned have different numbers.  */
+static unsigned int reading_selection_serial;
+
+struct pgtk_read_data
+{
+  unsigned int serial;
+  char *mime_type;
+};
+
+static void
+pgtk_selection_read_done (unsigned int serial, GBytes *bytes,
+			  const char *mime_type)
+{
+  if (serial != reading_selection_serial)
+    {
+      if (bytes)
+	g_bytes_unref (bytes);
+      return;
+    }
+
+  if (reading_selection_data)
+    g_bytes_unref (reading_selection_data);
+  reading_selection_data = bytes;
+  g_free (reading_selection_type);
+  reading_selection_type = g_strdup (mime_type);
+  XSETCAR (reading_selection_reply, bytes ? Qt : Qlambda);
+}
+
+static void
+pgtk_selection_splice_done (GObject *source, GAsyncResult *result,
+			    gpointer user_data)
+{
+  struct pgtk_read_data *data = user_data;
+  GOutputStream *output = G_OUTPUT_STREAM (source);
+  GError *error = NULL;
+  GBytes *bytes = NULL;
+
+  if (g_output_stream_splice_finish (output, result, &error) >= 0)
+    bytes = g_memory_output_stream_steal_as_bytes
+      (G_MEMORY_OUTPUT_STREAM (output));
+
+  g_clear_error (&error);
+  pgtk_selection_read_done (data->serial, bytes, data->mime_type);
+  g_object_unref (output);
+  g_free (data->mime_type);
+  xfree (data);
+}
+
+/* Read all of INPUT, the data of MIME_TYPE requested by read number
+   SERIAL.  */
+
+static void
+pgtk_selection_read_stream (GInputStream *input, const char *mime_type,
+			    unsigned int serial)
+{
+  struct pgtk_read_data *data;
+  GOutputStream *output;
+
+  if (!input)
+    {
+      pgtk_selection_read_done (serial, NULL, NULL);
+      return;
+    }
+
+  data = xmalloc (sizeof *data);
+  data->serial = serial;
+  data->mime_type = g_strdup (mime_type);
+  output = g_memory_output_stream_new_resizable ();
+  g_output_stream_splice_async (output, input,
+				(G_OUTPUT_STREAM_SPLICE_CLOSE_SOURCE
+				 | G_OUTPUT_STREAM_SPLICE_CLOSE_TARGET),
+				G_PRIORITY_DEFAULT, NULL,
+				pgtk_selection_splice_done, data);
+  g_object_unref (input);
+}
+
+static void
+pgtk_clipboard_read_cb (GObject *source, GAsyncResult *result,
+			gpointer user_data)
+{
+  const char *mime_type = NULL;
+  GError *error = NULL;
+  GInputStream *input;
+
+  input = gdk_clipboard_read_finish (GDK_CLIPBOARD (source), result,
+				     &mime_type, &error);
+  g_clear_error (&error);
+  pgtk_selection_read_stream (input, mime_type, GPOINTER_TO_UINT (user_data));
+}
+
+static void
+pgtk_drop_read_cb (GObject *source, GAsyncResult *result,
+		   gpointer user_data)
+{
+  const char *mime_type = NULL;
+  GError *error = NULL;
+  GInputStream *input;
+
+  input = gdk_drop_read_finish (GDK_DROP (source), result,
+				&mime_type, &error);
+  g_clear_error (&error);
+  pgtk_selection_read_stream (input, mime_type, GPOINTER_TO_UINT (user_data));
+}
+
+static void
+pgtk_display_selection_waiting_message (struct atimer *timer)
+{
+  Lisp_Object val;
+
+  val = build_string ("Waiting for reply from selection owner...");
+  message3_nolog (val);
+}
+
+static void
+pgtk_cancel_atimer (void *atimerp)
+{
+  struct atimer **timer = atimerp;
+  if (*timer)
+    {
+      cancel_atimer (*timer);
+      *timer = NULL;
+    }
+}
+
+/* Return the TARGETS of a selection whose data is available in
+   FORMATS, as a vector of symbols.  */
+
+static Lisp_Object
+pgtk_formats_to_targets (GdkContentFormats *formats)
+{
+  const char * const *mime_types;
+  gsize i, n;
+  Lisp_Object targets = Qnil;
+  bool utf8 = false, text = false;
+
+  mime_types = gdk_content_formats_get_mime_types (formats, &n);
+
+  for (i = 0; i < n; i++)
+    {
+      if (!strcmp (mime_types[i], PGTK_UTF8_MIME))
+	utf8 = true;
+      else if (!strcmp (mime_types[i], "text/plain"))
+	text = true;
+
+      targets = Fcons (intern (mime_types[i]), targets);
+    }
+
+  /* Make text available under the names Lisp asks for.  */
+  if (utf8 && NILP (Fmemq (QUTF8_STRING, targets)))
+    targets = Fcons (QUTF8_STRING, targets);
+  if ((utf8 || text) && NILP (Fmemq (QSTRING, targets)))
+    targets = Fcons (QSTRING, targets);
+  if ((utf8 || text) && NILP (Fmemq (QTEXT, targets)))
+    targets = Fcons (QTEXT, targets);
+
+  return Fvconcat (1, (Lisp_Object []) { Fnreverse (targets) });
+}
+
+/* Read the data of SELECTION_SYMBOL from its owner, converted to
+   TARGET_TYPE.  FRAME is the frame requesting it.  */
+
+static Lisp_Object
+pgtk_get_foreign_selection (Lisp_Object selection_symbol, Lisp_Object target_type,
+			    Lisp_Object time_stamp, Lisp_Object frame)
+{
+  struct frame *f = XFRAME (frame);
+  struct pgtk_display_info *dpyinfo = FRAME_DISPLAY_INFO (f);
+  GdkClipboard *clipboard = NULL;
+  GdkDrop *drop = NULL;
+  GdkContentFormats *formats;
+  const char *mime_types[3];
+  int n = 0;
+  struct atimer *delayed_message;
+  struct timespec message_interval;
+  specpdl_ref count = SPECPDL_INDEX ();
+  Lisp_Object str, lispy_type;
+  gsize size;
+  const char *data;
+
+  if (!FRAME_LIVE_P (f))
+    return Qnil;
+
+  if (EQ (selection_symbol, intern ("XdndSelection")))
+    {
+      drop = pgtk_current_drop;
+      if (!drop)
+	return Qnil;
+      formats = gdk_drop_get_formats (drop);
+    }
+  else
+    {
+      clipboard = pgtk_selection_clipboard (dpyinfo, selection_symbol);
+      if (!clipboard)
+	return Qnil;
+      formats = gdk_clipboard_get_formats (clipboard);
+    }
+
+  if (CONSP (target_type))
+    target_type = XCAR (target_type);
+
+  if (EQ (target_type, QTARGETS))
+    return pgtk_formats_to_targets (formats);
+
+  /* Work out the MIME types to read the data as.  */
+  if (EQ (target_type, QUTF8_STRING))
+    {
+      mime_types[n++] = PGTK_UTF8_MIME;
+      mime_types[n++] = "UTF8_STRING";
+    }
+  else if (EQ (target_type, QSTRING) || EQ (target_type, QTEXT))
+    {
+      mime_types[n++] = SSDATA (SYMBOL_NAME (target_type));
+      mime_types[n++] = "text/plain";
+    }
+  else
+    mime_types[n++] = SSDATA (SYMBOL_NAME (target_type));
+  mime_types[n] = NULL;
+
+  /* Don't ask for data that isn't there.  */
+  {
+    int i;
+    bool found = false;
+
+    for (i = 0; i < n; i++)
+      if (gdk_content_formats_contain_mime_type (formats, mime_types[i]))
+	found = true;
+
+    if (!found)
+      return Qnil;
+  }
+
+  block_input ();
+  XSETCAR (reading_selection_reply, Qnil);
+  reading_selection_serial++;
+
+  if (drop)
+    gdk_drop_read_async (drop, mime_types, G_PRIORITY_DEFAULT, NULL,
+			 pgtk_drop_read_cb,
+			 GUINT_TO_POINTER (reading_selection_serial));
+  else
+    gdk_clipboard_read_async (clipboard, mime_types, G_PRIORITY_DEFAULT,
+			      NULL, pgtk_clipboard_read_cb,
+			      GUINT_TO_POINTER (reading_selection_serial));
+  unblock_input ();
+
+  message_interval = make_timespec (1, 0);
+  delayed_message = start_atimer (ATIMER_RELATIVE, message_interval,
+				  pgtk_display_selection_waiting_message,
+				  &delayed_message);
+  record_unwind_protect_ptr (pgtk_cancel_atimer, &delayed_message);
+
+  /* This allows quits.  Also, don't wait forever.  */
+  intmax_t timeout = max (0, pgtk_selection_timeout);
+  intmax_t secs = timeout / 1000;
+  int nsecs = (timeout % 1000) * 1000000;
+
+  wait_reading_process_output (secs, nsecs, 0, false,
+			       reading_selection_reply, NULL, 0);
+
+  if (NILP (XCAR (reading_selection_reply)))
+    {
+      /* Discard the data if it arrives later.  */
+      reading_selection_serial++;
+      error ("Timed out waiting for reply from selection owner");
+    }
+
+  if (EQ (XCAR (reading_selection_reply), Qlambda)
+      || !reading_selection_data)
+    return unbind_to (count, Qnil);
+
+  data = g_bytes_get_data (reading_selection_data, &size);
+  str = make_unibyte_string (data ? data : "", size);
+  g_clear_pointer (&reading_selection_data, g_bytes_unref);
+
+  /* Indicate that this string is from foreign selection by a text
+     property `foreign-selection' so that the caller of
+     x-get-selection-internal (usually x-get-selection) can know
+     that the string must be decoded.  */
+  if (reading_selection_type
+      && (!strcmp (reading_selection_type, PGTK_UTF8_MIME)
+	  || !strcmp (reading_selection_type, "UTF8_STRING")))
+    lispy_type = QUTF8_STRING;
+  else if (reading_selection_type
+	   && !strcmp (reading_selection_type, "COMPOUND_TEXT"))
+    lispy_type = QCOMPOUND_TEXT;
+  else
+    lispy_type = QSTRING;
+
+  if (SCHARS (str) > 0)
+    Fput_text_property (make_fixnum (0), make_fixnum (SCHARS (str)),
+			Qforeign_selection, lispy_type, str);
+
+  return unbind_to (count, str);
+}
+
+void
+pgtk_selection_init (struct pgtk_display_info *dpyinfo)
+{
+}
+
+void
+pgtk_selection_finish (struct pgtk_display_info *dpyinfo)
+{
+  GdkClipboard *clipboard;
+
+  if (!dpyinfo->gdpy)
+    return;
+
+  clipboard = gdk_display_get_clipboard (dpyinfo->gdpy);
+  pgtk_release_clipboard (clipboard);
+  clipboard = gdk_display_get_primary_clipboard (dpyinfo->gdpy);
+  pgtk_release_clipboard (clipboard);
+}
+
+#endif /* HAVE_GTK4 */
+
 static Lisp_Object
 pgtk_get_local_selection (Lisp_Object selection_symbol, Lisp_Object target_type,
 			  bool local_request, struct pgtk_display_info *dpyinfo)
@@ -311,6 +1208,7 @@ pgtk_get_local_selection (Lisp_Object selection_symbol, Lisp_Object target_type,
 		list2 (handler_fn, value));
 }
 
+#ifndef HAVE_GTK4
 static void
 pgtk_decline_selection_request (struct selection_input_event *event)
 {
@@ -1543,6 +2441,8 @@ lisp_data_to_selection_data (struct pgtk_display_info *dpyinfo,
   cs->type = symbol_to_gdk_atom (type);
 }
 
+#endif /* !HAVE_GTK4 */
+
 static Lisp_Object
 clean_local_selection_data (Lisp_Object obj)
 {
@@ -1688,8 +2588,12 @@ server to query.  If omitted or nil, that stands for the selected
 frame's display, or the first available X display.  */)
   (Lisp_Object selection, Lisp_Object time_object, Lisp_Object terminal)
 {
+#ifndef HAVE_GTK4
   guint32 timestamp;
   GdkAtom selection_atom;
+#else
+  GdkClipboard *clipboard;
+#endif
   struct frame *f = frame_for_pgtk_selection (terminal);
   struct pgtk_display_info *dpyinfo;
 
@@ -1703,6 +2607,7 @@ frame's display, or the first available X display.  */)
   if (NILP (LOCAL_SELECTION (selection, dpyinfo)))
     return Qnil;
 
+#ifndef HAVE_GTK4
   selection_atom = symbol_to_gdk_atom (selection);
 
   block_input ();
@@ -1714,6 +2619,26 @@ frame's display, or the first available X display.  */)
 				       selection_atom, timestamp,
 				       TRUE);
   unblock_input ();
+#else
+  block_input ();
+  if ((clipboard = pgtk_selection_clipboard (dpyinfo, selection)))
+    pgtk_release_clipboard (clipboard);
+  unblock_input ();
+
+  /* GDK doesn't tell Emacs about the loss of a selection it gave up
+     itself, so forget it now.  */
+  {
+    struct selection_input_event event;
+
+    event.kind = SELECTION_CLEAR_EVENT;
+    event.dpyinfo = dpyinfo;
+    event.selection = (EQ (selection, QCLIPBOARD) ? "CLIPBOARD"
+		       : EQ (selection, QPRIMARY) ? "PRIMARY" : "SECONDARY");
+    event.request = NULL;
+    event.time = GDK_CURRENT_TIME;
+    pgtk_handle_selection_clear (&event);
+  }
+#endif
 
   return Qt;
 }
@@ -1757,8 +2682,13 @@ server to query.  If omitted or nil, that stands for the selected
 frame's display, or the first available X display.  */)
   (Lisp_Object selection, Lisp_Object terminal)
 {
+#ifndef HAVE_GTK4
   GdkWindow *owner;
   GdkAtom atom;
+#else
+  GdkClipboard *clipboard;
+  gsize n = 0;
+#endif
   struct frame *f = frame_for_pgtk_selection (terminal);
   struct pgtk_display_info *dpyinfo;
 
@@ -1774,14 +2704,26 @@ frame's display, or the first available X display.  */)
   if (!NILP (LOCAL_SELECTION (selection, dpyinfo)))
     return Qt;
 
+#ifndef HAVE_GTK4
   atom = symbol_to_gdk_atom (selection);
   if (atom == 0) return Qnil;
   block_input ();
   owner = gdk_selection_owner_get_for_display (dpyinfo->display, atom);
   unblock_input ();
   return (owner ? Qt : Qnil);
+#else
+  clipboard = pgtk_selection_clipboard (dpyinfo, selection);
+  if (!clipboard)
+    return Qnil;
+
+  /* A selection exists if it offers some data.  */
+  gdk_content_formats_get_mime_types (gdk_clipboard_get_formats (clipboard),
+				      &n);
+  return n ? Qt : Qnil;
+#endif
 }
 
+#ifndef HAVE_GTK4
 /* Called to handle GDK_SELECTION_NOTIFY events.
    If it's the selection we are waiting for, stop waiting
    by setting the car of reading_selection_reply to non-nil.
@@ -1801,6 +2743,8 @@ pgtk_handle_selection_notify (GdkEventSelection *event)
 }
 
 
+#endif /* !HAVE_GTK4 */
+
 /***********************************************************************
                       Drag and drop support
 ***********************************************************************/
@@ -1812,6 +2756,13 @@ TARGETS should be a list of strings describing data types (selection
 targets) that can be dropped on top of FRAME.  */)
   (Lisp_Object frame, Lisp_Object targets)
 {
+#ifdef HAVE_GTK4
+  /* Under GTK 4, drops of any type are accepted, and Lisp chooses
+     among the types offered.  */
+  decode_window_system_frame (frame);
+  CHECK_LIST (targets);
+  return Qnil;
+#else
   struct frame *f;
   GtkTargetEntry *entries;
   GtkTargetList *list;
@@ -1852,6 +2803,7 @@ targets) that can be dropped on top of FRAME.  */)
   SAFE_FREE ();
 
   return Qnil;
+#endif
 }
 
 DEFUN ("pgtk-drop-finish", Fpgtk_drop_finish, Spgtk_drop_finish, 3, 3, 0,
@@ -1970,6 +2922,8 @@ Note that this does not affect setting or owning selections.  */);
   reading_selection_reply = Fcons (Qnil, Qnil);
   staticpro (&reading_selection_reply);
 
+#ifndef HAVE_GTK4
   property_change_reply = Fcons (Qnil, Qnil);
   staticpro (&property_change_reply);
+#endif
 }

@@ -30,6 +30,70 @@ along with GNU Emacs.  If not, see <https://www.gnu.org/licenses/>.  */
 
 #include <gtk/gtk.h>
 
+/* keyboard.c names dead keys by their X keysyms, which match the GDK
+   key values; without these, dead keys produce no event at all when
+   no input method handles them.  */
+#if !defined XK_dead_abovedot && defined GDK_KEY_dead_abovedot
+# define XK_dead_abovedot GDK_KEY_dead_abovedot
+#endif
+#if !defined XK_dead_abovering && defined GDK_KEY_dead_abovering
+# define XK_dead_abovering GDK_KEY_dead_abovering
+#endif
+#if !defined XK_dead_acute && defined GDK_KEY_dead_acute
+# define XK_dead_acute GDK_KEY_dead_acute
+#endif
+#if !defined XK_dead_belowdot && defined GDK_KEY_dead_belowdot
+# define XK_dead_belowdot GDK_KEY_dead_belowdot
+#endif
+#if !defined XK_dead_breve && defined GDK_KEY_dead_breve
+# define XK_dead_breve GDK_KEY_dead_breve
+#endif
+#if !defined XK_dead_caron && defined GDK_KEY_dead_caron
+# define XK_dead_caron GDK_KEY_dead_caron
+#endif
+#if !defined XK_dead_cedilla && defined GDK_KEY_dead_cedilla
+# define XK_dead_cedilla GDK_KEY_dead_cedilla
+#endif
+#if !defined XK_dead_circumflex && defined GDK_KEY_dead_circumflex
+# define XK_dead_circumflex GDK_KEY_dead_circumflex
+#endif
+#if !defined XK_dead_degree && defined GDK_KEY_dead_degree
+# define XK_dead_degree GDK_KEY_dead_degree
+#endif
+#if !defined XK_dead_diaeresis && defined GDK_KEY_dead_diaeresis
+# define XK_dead_diaeresis GDK_KEY_dead_diaeresis
+#endif
+#if !defined XK_dead_doubleacute && defined GDK_KEY_dead_doubleacute
+# define XK_dead_doubleacute GDK_KEY_dead_doubleacute
+#endif
+#if !defined XK_dead_grave && defined GDK_KEY_dead_grave
+# define XK_dead_grave GDK_KEY_dead_grave
+#endif
+#if !defined XK_dead_hook && defined GDK_KEY_dead_hook
+# define XK_dead_hook GDK_KEY_dead_hook
+#endif
+#if !defined XK_dead_horn && defined GDK_KEY_dead_horn
+# define XK_dead_horn GDK_KEY_dead_horn
+#endif
+#if !defined XK_dead_iota && defined GDK_KEY_dead_iota
+# define XK_dead_iota GDK_KEY_dead_iota
+#endif
+#if !defined XK_dead_macron && defined GDK_KEY_dead_macron
+# define XK_dead_macron GDK_KEY_dead_macron
+#endif
+#if !defined XK_dead_ogonek && defined GDK_KEY_dead_ogonek
+# define XK_dead_ogonek GDK_KEY_dead_ogonek
+#endif
+#if !defined XK_dead_semivoiced_sound && defined GDK_KEY_dead_semivoiced_sound
+# define XK_dead_semivoiced_sound GDK_KEY_dead_semivoiced_sound
+#endif
+#if !defined XK_dead_tilde && defined GDK_KEY_dead_tilde
+# define XK_dead_tilde GDK_KEY_dead_tilde
+#endif
+#if !defined XK_dead_voiced_sound && defined GDK_KEY_dead_voiced_sound
+# define XK_dead_voiced_sound GDK_KEY_dead_voiced_sound
+#endif
+
 #ifdef CAIRO_HAS_PDF_SURFACE
 #include <cairo-pdf.h>
 #endif
@@ -190,6 +254,13 @@ struct pgtk_display_info
 
   /* DPI resolution of this screen */
   double resx, resy;
+
+#ifdef HAVE_GTK4
+  /* The resolution of text in logical pixels, which reflects the
+     user's text scaling factor.  The resolution of a frame is this
+     multiplied by its scale.  */
+  double text_resolution;
+#endif
 
   /* Mask of things that cause the mouse to be grabbed */
   int grabbed;
@@ -373,7 +444,16 @@ struct pgtk_output
   int in_animation;
 
   /* The last size hints set.  */
+#ifndef HAVE_GTK4
   GdkGeometry size_hints;
+#else
+  /* GTK 4 has no window geometry hints; only the minimum size of the
+     edit widget, in GTK logical pixels, is used.  */
+  struct
+  {
+    int min_width, min_height;
+  } size_hints;
+#endif
   long hint_flags;
   int preferred_width, preferred_height;
 
@@ -450,6 +530,39 @@ struct pgtk_output
      I watch it periodically with atimer. */
   double watched_scale_factor;
   struct atimer *scale_factor_atimer;
+
+#ifdef HAVE_GTK4
+  /* The number of device pixels per GTK logical pixel on the surface
+     this frame is displayed on.  This can be fractional.  Emacs
+     pixels are device pixels; GTK widgets are positioned and sized
+     in logical pixels.  */
+  double scale;
+
+  /* A texture holding the contents of the visible Cairo surface,
+     created on demand when the edit widget is snapshotted and
+     discarded whenever the surface changes.  */
+  GdkTexture *texture;
+
+  /* The popover used to display this frame if it is a tooltip
+     frame.  */
+  GtkWidget *tip_popover;
+
+  /* The cursor currently displayed in the edit widget.  */
+  GdkCursor *displayed_cursor;
+
+  /* The resolution of the frame, in device pixels per inch, or 0 if it
+     is that of its display.  */
+  double resolution;
+
+  /* The default size last given to the toplevel window, and the size
+     its contents were to get with it, in logical pixels.  */
+  int last_default_width, last_default_height;
+  int last_content_width, last_content_height;
+
+  /* Whether the fonts of the frame are to be reopened because its
+     resolution changed.  */
+  bool_bf rescale_pending : 1;
+#endif
 };
 
 /* Satisfy term.c.  */
@@ -489,8 +602,22 @@ enum
 #define FRAME_PGTK_VIEW(f)         FRAME_GTK_WIDGET (f)
 #define FRAME_X_WINDOW(f)          FRAME_GTK_OUTER_WIDGET (f)
 #define FRAME_NATIVE_WINDOW(f)     GTK_WINDOW (FRAME_X_WINDOW (f))
+#ifndef HAVE_GTK4
 #define FRAME_GDK_WINDOW(f)			\
   gtk_widget_get_window (FRAME_GTK_WIDGET (f))
+#else
+/* The GdkSurface F's edit widget is displayed on, or NULL.  */
+#define FRAME_GDK_SURFACE(f) pgtk_frame_gdk_surface (f)
+
+/* The scale between device pixels (which Emacs uses) and logical
+   pixels (which GTK uses) for F.  */
+#define FRAME_GTK_SCALE(f) (FRAME_X_OUTPUT (f)->scale)
+
+/* Convert the Emacs (device) pixel value X on F to GTK logical
+   pixels, and back.  */
+#define PGTK_TO_LOGICAL(f, x) ((x) / FRAME_GTK_SCALE (f))
+#define PGTK_TO_DEVICE(f, x) ((x) * FRAME_GTK_SCALE (f))
+#endif
 
 #define FRAME_X_DISPLAY(f)        (FRAME_DISPLAY_INFO (f)->gdpy)
 
@@ -536,6 +663,7 @@ enum
 /* For an event of kind SELECTION_REQUEST_EVENT,
    this structure really describes the contents.  */
 
+#ifndef HAVE_GTK4
 struct selection_input_event
 {
   ENUM_BF (event_kind) kind : EVENT_KIND_WIDTH;
@@ -545,6 +673,23 @@ struct selection_input_event
   GdkAtom selection, target, property;
   guint32 time;
 };
+#else
+/* A request for the contents of a selection Emacs owns, made by
+   another client through GdkClipboard.  Defined in pgtkselect.c.  */
+struct pgtk_selection_request;
+
+struct selection_input_event
+{
+  ENUM_BF (event_kind) kind : EVENT_KIND_WIDTH;
+  struct pgtk_display_info *dpyinfo;
+  /* The selection (as a symbol name such as "PRIMARY") this event
+     is about.  Static storage.  */
+  const char *selection;
+  /* For SELECTION_REQUEST_EVENT, the request being made.  */
+  struct pgtk_selection_request *request;
+  guint32 time;
+};
+#endif
 
 /* Unlike macros below, this can't be used as an lvalue.  */
 INLINE GdkDisplay *
@@ -554,22 +699,34 @@ SELECTION_EVENT_DISPLAY (struct selection_input_event *ev)
 }
 #define SELECTION_EVENT_DPYINFO(eventp) \
   ((eventp)->dpyinfo)
+#ifndef HAVE_GTK4
 /* We spell it with an "o" here because X does.  */
 #define SELECTION_EVENT_REQUESTOR(eventp)	\
   ((eventp)->requestor)
-#define SELECTION_EVENT_SELECTION(eventp)	\
-  ((eventp)->selection)
 #define SELECTION_EVENT_TARGET(eventp)	\
   ((eventp)->target)
 #define SELECTION_EVENT_PROPERTY(eventp)	\
   ((eventp)->property)
+#else
+#define SELECTION_EVENT_REQUEST(eventp)		\
+  ((eventp)->request)
+#endif
+#define SELECTION_EVENT_SELECTION(eventp)	\
+  ((eventp)->selection)
 #define SELECTION_EVENT_TIME(eventp)	\
   ((eventp)->time)
 
 extern void pgtk_handle_selection_event (struct selection_input_event *);
 extern void pgtk_clear_frame_selections (struct frame *);
+#ifndef HAVE_GTK4
 extern void pgtk_handle_property_notify (GdkEventProperty *);
 extern void pgtk_handle_selection_notify (GdkEventSelection *);
+#else
+extern void pgtk_selection_init (struct pgtk_display_info *);
+extern void pgtk_selection_finish (struct pgtk_display_info *);
+extern void pgtk_free_selection_request (struct pgtk_selection_request *);
+extern void pgtk_drop_set_current (GdkDrop *);
+#endif
 
 /* Display init/shutdown functions implemented in pgtkterm.c */
 extern struct pgtk_display_info *pgtk_term_init (Lisp_Object, char *);
@@ -663,7 +820,11 @@ extern void pgtk_enqueue_string (struct frame *, gchar *);
 extern void pgtk_enqueue_preedit (struct frame *, Lisp_Object);
 extern void pgtk_im_focus_in (struct frame *);
 extern void pgtk_im_focus_out (struct frame *);
+#ifndef HAVE_GTK4
 extern bool pgtk_im_filter_keypress (struct frame *, GdkEventKey *);
+#else
+extern bool pgtk_im_filter_keypress (struct frame *, GdkEvent *);
+#endif
 extern void pgtk_im_set_cursor_location (struct frame *, int, int,
 					 int, int);
 extern void pgtk_im_init (struct pgtk_display_info *);
@@ -676,6 +837,18 @@ extern bool pgtk_text_icon (struct frame *, const char *);
 
 extern double pgtk_frame_scale_factor (struct frame *);
 extern int pgtk_emacs_to_gtk_modifiers (struct pgtk_display_info *, int);
+
+#ifdef HAVE_GTK4
+/* GTK 4 specific functions implemented in pgtkterm.c.  */
+extern GdkSurface *pgtk_frame_gdk_surface (struct frame *);
+extern void pgtk_snapshot_frame (struct frame *, GtkWidget *, GtkSnapshot *);
+extern void pgtk_edit_widget_allocated (struct frame *, int, int);
+extern void pgtk_update_frame_scale (struct frame *);
+extern double pgtk_display_scale (struct pgtk_display_info *);
+extern void pgtk_set_frame_cursor (struct frame *, GdkCursor *);
+extern void pgtk_wait_for_main_loop (bool *, double);
+extern struct frame *pgtk_widget_to_frame (GtkWidget *);
+#endif
 
 #endif /* HAVE_PGTK */
 #endif /* _PGTKTERM_H_ */

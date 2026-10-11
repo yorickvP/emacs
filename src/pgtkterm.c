@@ -66,7 +66,16 @@ along with GNU Emacs.  If not, see <https://www.gnu.org/licenses/>.  */
 #include "emacsgtkfixed.h"
 
 #ifdef GDK_WINDOWING_WAYLAND
+#ifdef HAVE_GTK4
+#include <gdk/wayland/gdkwayland.h>
+#else
 #include <gdk/gdkwayland.h>
+#endif
+#endif
+
+#ifdef HAVE_GTK4
+/* GDK 4 renamed this modifier.  */
+#define GDK_MOD1_MASK GDK_ALT_MASK
 #endif
 
 #define FRAME_CR_CONTEXT(f)		((f)->output_data.pgtk->cr_context)
@@ -98,12 +107,23 @@ static Time ignore_next_mouse_click_timeout;
 /* The default Emacs icon .  */
 static Lisp_Object xg_default_icon_file;
 
+#ifndef HAVE_GTK4
 /* The current GdkDragContext of a drop.  */
 static GdkDragContext *current_drop_context;
 
 /* Whether or not current_drop_context was set from a drop
    handler.  */
 static bool current_drop_context_drop;
+#else
+/* The current drop, and the action Lisp last asked for it.  */
+static GdkDrop *current_drop;
+static GdkDragAction current_drop_action;
+
+/* Where the current drop was last reported to Lisp, and the actions
+   its source offered then.  */
+static double current_drop_x, current_drop_y;
+static GdkDragAction current_drop_source_actions;
+#endif
 
 /* The time of the last drop.  */
 static guint32 current_drop_time;
@@ -115,7 +135,9 @@ static void pgtk_fill_rectangle (struct frame *, unsigned long, int, int,
 				 int, int, bool);
 static void pgtk_clip_to_row (struct window *, struct glyph_row *,
 			      enum glyph_row_area, cairo_t *);
+#ifndef HAVE_GTK4
 static struct frame *pgtk_any_window_to_frame (GdkWindow *);
+#endif
 static void pgtk_regenerate_devices (struct pgtk_display_info *);
 
 static void
@@ -176,8 +198,13 @@ pgtk_enumerate_devices (struct pgtk_display_info *dpyinfo,
 	}
 
       /* We only want slaves, not master devices.  */
+#ifndef HAVE_GTK4
       devices_on_seat = gdk_seat_get_slaves (seat,
 					     GDK_SEAT_CAPABILITY_ALL);
+#else
+      devices_on_seat = gdk_seat_get_devices (seat,
+					      GDK_SEAT_CAPABILITY_ALL);
+#endif
 
       for (t1 = devices_on_seat; t1; t1 = t1->next)
 	{
@@ -248,7 +275,11 @@ pgtk_get_device_for_event (struct pgtk_display_info *dpyinfo,
   struct pgtk_device_t *tem;
   GdkDevice *device;
 
+#ifndef HAVE_GTK4
   device = gdk_event_get_source_device (event);
+#else
+  device = gdk_event_get_device (event);
+#endif
 
   if (!device)
     return Qt;
@@ -279,6 +310,9 @@ flip_cr_context (struct frame *f)
 
       FRAME_CR_ACTIVE_CONTEXT (f)
 	= cairo_reference (FRAME_CR_CONTEXT (f));
+#ifdef HAVE_GTK4
+      g_clear_object (&FRAME_X_OUTPUT (f)->texture);
+#endif
     }
   unblock_input ();
 }
@@ -390,7 +424,7 @@ mark_pgtkterm (void)
 char *
 get_keysym_name (int keysym)
 {
-  return gdk_keyval_name (keysym);
+  return (char *) gdk_keyval_name (keysym);
 }
 
 void
@@ -410,8 +444,24 @@ pgtk_raise_frame (struct frame *f)
      It does not work for child frames on X, and it does not work
      on Wayland too. */
   block_input ();
+#ifndef HAVE_GTK4
   if (FRAME_VISIBLE_P (f))
     gdk_window_raise (gtk_widget_get_window (FRAME_WIDGET (f)));
+#else
+  if (FRAME_VISIBLE_P (f))
+    {
+      GtkWidget *fixed = FRAME_GTK_WIDGET (f);
+      GtkWidget *parent = gtk_widget_get_parent (fixed);
+
+      /* Child frames are raised by moving them to the end of the list
+	 of children of their parent.  Toplevel windows can't be raised
+	 under GTK 4, but presenting them is the next best thing.  */
+      if (FRAME_GTK_OUTER_WIDGET (f))
+	gtk_window_present (GTK_WINDOW (FRAME_GTK_OUTER_WIDGET (f)));
+      else if (parent)
+	gtk_widget_insert_before (fixed, parent, NULL);
+    }
+#endif
   unblock_input ();
 }
 
@@ -423,7 +473,25 @@ pgtk_lower_frame (struct frame *f)
   if (FRAME_VISIBLE_P (f))
     {
       block_input ();
+#ifndef HAVE_GTK4
       gdk_window_lower (gtk_widget_get_window (FRAME_WIDGET (f)));
+#else
+      GtkWidget *fixed = FRAME_GTK_WIDGET (f);
+      GtkWidget *parent = gtk_widget_get_parent (fixed);
+      GtkWidget *child;
+
+      /* Move a child frame below all other child frames of its
+	 parent.  */
+      if (!FRAME_GTK_OUTER_WIDGET (f) && parent)
+	for (child = gtk_widget_get_first_child (parent); child;
+	     child = gtk_widget_get_next_sibling (child))
+	  if (EMACS_IS_FIXED (child))
+	    {
+	      if (child != fixed)
+		gtk_widget_insert_before (fixed, parent, child);
+	      break;
+	    }
+#endif
       unblock_input ();
     }
 }
@@ -560,6 +628,10 @@ pgtk_free_frame_resources (struct frame *f)
       FRAME_X_OUTPUT (f)->border_color_css_provider = NULL;
     }
 
+#ifdef HAVE_GTK4
+  g_clear_object (&FRAME_X_OUTPUT (f)->texture);
+#endif
+
   if (FRAME_X_OUTPUT (f)->scrollbar_foreground_css_provider != NULL)
     {
       GtkCssProvider *old
@@ -576,7 +648,35 @@ pgtk_free_frame_resources (struct frame *f)
       FRAME_X_OUTPUT (f)->scrollbar_background_css_provider = NULL;
     }
 
+#ifndef HAVE_GTK4
   gtk_widget_destroy (FRAME_WIDGET (f));
+#else
+  /* Make sure the edit widget no longer refers to F, in case GTK still
+     holds a reference to it.  */
+  emacs_fixed_set_frame (FRAME_GTK_WIDGET (f), NULL);
+
+  if (FRAME_X_OUTPUT (f)->tip_popover)
+    {
+      GtkWidget *popover = FRAME_X_OUTPUT (f)->tip_popover;
+
+      FRAME_X_OUTPUT (f)->tip_popover = NULL;
+      if (gtk_widget_get_parent (popover))
+	gtk_widget_unparent (popover);
+      else
+	g_object_unref (popover);
+    }
+  else if (FRAME_GTK_OUTER_WIDGET (f))
+    {
+      g_clear_object (&FRAME_X_OUTPUT (f)->toolbar_widget);
+      gtk_window_destroy (GTK_WINDOW (FRAME_GTK_OUTER_WIDGET (f)));
+    }
+  else if (gtk_widget_get_parent (FRAME_GTK_WIDGET (f)))
+    /* A child frame.  */
+    gtk_widget_unparent (FRAME_GTK_WIDGET (f));
+
+  FRAME_GTK_OUTER_WIDGET (f) = NULL;
+  FRAME_GTK_WIDGET (f) = NULL;
+#endif
 
   if (FRAME_X_OUTPUT (f)->cr_surface_visible_bell != NULL)
     {
@@ -713,6 +813,7 @@ pgtk_set_offset (struct frame *f, int xoff, int yoff, int change_gravity)
 
   if (change_gravity != 0)
     {
+#ifndef HAVE_GTK4
       if (FRAME_GTK_OUTER_WIDGET (f))
 	gtk_window_move (GTK_WINDOW (FRAME_GTK_OUTER_WIDGET (f)),
 			 f->left_pos, f->top_pos);
@@ -723,6 +824,20 @@ pgtk_set_offset (struct frame *f, int xoff, int yoff, int change_gravity)
 	  gtk_fixed_move (GTK_FIXED (parent), fixed,
 			  f->left_pos, f->top_pos);
 	}
+#else
+      /* Toplevel windows can't be moved under GTK 4.  */
+      if (!FRAME_GTK_OUTER_WIDGET (f) && FRAME_PARENT_FRAME (f))
+	{
+	  GtkWidget *fixed = FRAME_GTK_WIDGET (f);
+	  GtkWidget *parent = gtk_widget_get_parent (fixed);
+	  struct frame *p = FRAME_PARENT_FRAME (f);
+
+	  if (parent)
+	    emacs_fixed_move (parent, fixed,
+			      PGTK_TO_LOGICAL (p, f->left_pos),
+			      PGTK_TO_LOGICAL (p, f->top_pos));
+	}
+#endif
     }
   unblock_input ();
   return;
@@ -737,8 +852,10 @@ pgtk_set_window_size (struct frame *f, bool change_gravity,
 {
   block_input ();
 
+#ifndef HAVE_GTK4
   f->output_data.pgtk->preferred_width = pixelwidth;
   f->output_data.pgtk->preferred_height = pixelheight;
+#endif
 
   xg_frame_set_char_size (f, pixelwidth, pixelheight);
   gtk_widget_queue_resize (FRAME_WIDGET (f));
@@ -766,12 +883,19 @@ pgtk_iconify_frame (struct frame *f)
 
   if (FRAME_GTK_OUTER_WIDGET (f))
     {
+      window = GTK_WINDOW (FRAME_GTK_OUTER_WIDGET (f));
+
+#ifndef HAVE_GTK4
       if (!FRAME_VISIBLE_P (f))
 	gtk_widget_show_all (FRAME_GTK_OUTER_WIDGET (f));
 
-      window = GTK_WINDOW (FRAME_GTK_OUTER_WIDGET (f));
-
       gtk_window_iconify (window);
+#else
+      if (!FRAME_VISIBLE_P (f))
+	gtk_window_present (window);
+
+      gtk_window_minimize (window);
+#endif
 
       /* Don't make the frame iconified here.  Doing so will cause it
 	 to be skipped by redisplay, until GDK says it is deiconified
@@ -786,6 +910,7 @@ pgtk_iconify_frame (struct frame *f)
     }
 }
 
+#ifndef HAVE_GTK4
 static gboolean
 pgtk_make_frame_visible_wait_for_event_cb (GtkWidget *widget,
 					   GdkEventAny *event,
@@ -795,6 +920,15 @@ pgtk_make_frame_visible_wait_for_event_cb (GtkWidget *widget,
   *foundptr = 1;
   return FALSE;
 }
+#else
+static void
+pgtk_make_frame_visible_wait_for_event_cb (GtkWidget *widget,
+					   gpointer user_data)
+{
+  int *foundptr = user_data;
+  *foundptr = 1;
+}
+#endif
 
 static gboolean
 pgtk_make_frame_visible_wait_for_event_timeout (gpointer user_data)
@@ -824,7 +958,11 @@ pgtk_wait_for_event (struct frame *f, const gchar *signal_name)
 			 &timed_out);
 
       while (!found && !timed_out)
+#ifndef HAVE_GTK4
 	gtk_main_iteration ();
+#else
+	g_main_context_iteration (NULL, TRUE);
+#endif
 
       g_signal_handler_disconnect (FRAME_WIDGET (f), id);
 
@@ -840,11 +978,26 @@ pgtk_make_frame_visible (struct frame *f)
 
   if (!FRAME_VISIBLE_P (f))
     {
+#ifndef HAVE_GTK4
       gtk_widget_show (FRAME_WIDGET (f));
       if (win)
 	gtk_window_deiconify (GTK_WINDOW (win));
 
       pgtk_wait_for_event (f, "map-event");
+#else
+      if (FRAME_X_OUTPUT (f)->tip_popover)
+	gtk_popover_popup (GTK_POPOVER (FRAME_X_OUTPUT (f)->tip_popover));
+      else if (win)
+	{
+	  gtk_window_unminimize (GTK_WINDOW (win));
+	  gtk_window_present (GTK_WINDOW (win));
+	}
+      else
+	gtk_widget_set_visible (FRAME_WIDGET (f), TRUE);
+
+      if (!gtk_widget_get_mapped (FRAME_GTK_WIDGET (f)))
+	pgtk_wait_for_event (f, "map");
+#endif
     }
 }
 
@@ -854,9 +1007,16 @@ pgtk_make_frame_invisible (struct frame *f)
 {
   if (FRAME_VISIBLE_P (f))
     {
+#ifndef HAVE_GTK4
       gtk_widget_hide (FRAME_WIDGET (f));
 
       pgtk_wait_for_event (f, "unmap-event");
+#else
+      if (FRAME_X_OUTPUT (f)->tip_popover)
+	gtk_popover_popdown (GTK_POPOVER (FRAME_X_OUTPUT (f)->tip_popover));
+      else
+	gtk_widget_set_visible (FRAME_WIDGET (f), FALSE);
+#endif
 
       SET_FRAME_VISIBLE (f, 0);
       SET_FRAME_ICONIFIED (f, false);
@@ -934,6 +1094,7 @@ pgtk_new_font (struct frame *f, Lisp_Object font_object, int fontset)
   return font_object;
 }
 
+#ifndef HAVE_GTK4
 int
 pgtk_display_pixel_height (struct pgtk_display_info *dpyinfo)
 {
@@ -951,6 +1112,232 @@ pgtk_display_pixel_width (struct pgtk_display_info *dpyinfo)
 
   return gdk_screen_get_width (gscr);
 }
+#else
+/* Store the bounding box of all monitors of DPYINFO in device pixels
+   into *RECT.  */
+
+static void
+pgtk_display_bounds (struct pgtk_display_info *dpyinfo, GdkRectangle *rect)
+{
+  GListModel *monitors = gdk_display_get_monitors (dpyinfo->gdpy);
+  guint i, n = g_list_model_get_n_items (monitors);
+  double scale = pgtk_display_scale (dpyinfo);
+
+  rect->x = rect->y = rect->width = rect->height = 0;
+
+  for (i = 0; i < n; i++)
+    {
+      GdkMonitor *monitor = g_list_model_get_item (monitors, i);
+      GdkRectangle geom;
+
+      gdk_monitor_get_geometry (monitor, &geom);
+      if (i == 0)
+	*rect = geom;
+      else
+	gdk_rectangle_union (rect, &geom, rect);
+      g_object_unref (monitor);
+    }
+
+  rect->x = lrint (rect->x * scale);
+  rect->y = lrint (rect->y * scale);
+  rect->width = lrint (rect->width * scale);
+  rect->height = lrint (rect->height * scale);
+}
+
+int
+pgtk_display_pixel_height (struct pgtk_display_info *dpyinfo)
+{
+  GdkRectangle rect;
+
+  pgtk_display_bounds (dpyinfo, &rect);
+  return rect.height;
+}
+
+int
+pgtk_display_pixel_width (struct pgtk_display_info *dpyinfo)
+{
+  GdkRectangle rect;
+
+  pgtk_display_bounds (dpyinfo, &rect);
+  return rect.width;
+}
+
+/* Return the largest scale of any monitor of DPYINFO.  Emacs uses this
+   as the scale of frames until it knows the actual scale of the
+   surfaces they are displayed on.  */
+
+double
+pgtk_display_scale (struct pgtk_display_info *dpyinfo)
+{
+  GListModel *monitors = gdk_display_get_monitors (dpyinfo->gdpy);
+  guint i, n = g_list_model_get_n_items (monitors);
+  double scale = 1.0;
+
+  for (i = 0; i < n; i++)
+    {
+      GdkMonitor *monitor = g_list_model_get_item (monitors, i);
+
+      scale = max (scale, gdk_monitor_get_scale (monitor));
+      g_object_unref (monitor);
+    }
+
+  return scale;
+}
+
+/* Return the surface F is displayed on, or NULL if F's widgets have
+   not been realized.  */
+
+GdkSurface *
+pgtk_frame_gdk_surface (struct frame *f)
+{
+  GtkNative *native;
+
+  if (!FRAME_GTK_WIDGET (f))
+    return NULL;
+
+  native = gtk_widget_get_native (FRAME_GTK_WIDGET (f));
+  return native ? gtk_native_get_surface (native) : NULL;
+}
+
+/* Return the frame that WIDGET belongs to, or NULL.  */
+
+struct frame *
+pgtk_widget_to_frame (GtkWidget *widget)
+{
+  GtkWidget *w;
+  Lisp_Object tail, frame;
+  GtkRoot *root;
+
+  for (w = widget; w; w = gtk_widget_get_parent (w))
+    if (EMACS_IS_FIXED (w))
+      return emacs_fixed_get_frame (w);
+
+  root = gtk_widget_get_root (widget);
+
+  FOR_EACH_FRAME (tail, frame)
+    {
+      struct frame *f = XFRAME (frame);
+
+      if (FRAME_PGTK_P (f)
+	  && FRAME_GTK_OUTER_WIDGET (f)
+	  && GTK_WIDGET (root) == FRAME_GTK_OUTER_WIDGET (f))
+	return f;
+    }
+
+  return NULL;
+}
+
+/* Display CURSOR in the edit widget of F.  */
+
+void
+pgtk_set_frame_cursor (struct frame *f, GdkCursor *cursor)
+{
+  if (FRAME_GTK_WIDGET (f) && FRAME_X_OUTPUT (f)->displayed_cursor != cursor)
+    {
+      FRAME_X_OUTPUT (f)->displayed_cursor = cursor;
+      gtk_widget_set_cursor (FRAME_GTK_WIDGET (f), cursor);
+    }
+}
+
+/* Return the position of the top left corner of F's edit widget,
+   relative to the surface it is displayed on, in device pixels.  The
+   frame's contents are drawn so that this falls on a pixel boundary,
+   see pgtk_snapshot_frame.  */
+
+static void
+pgtk_frame_device_origin (struct frame *f, int *x, int *y)
+{
+  GtkWidget *fixed = FRAME_GTK_WIDGET (f);
+  GtkNative *native = gtk_widget_get_native (fixed);
+  double scale = FRAME_GTK_SCALE (f), tx = 0, ty = 0;
+  graphene_point_t origin = GRAPHENE_POINT_INIT (0, 0);
+
+  if (native)
+    {
+      gtk_native_get_surface_transform (native, &tx, &ty);
+      if (!gtk_widget_compute_point (fixed, GTK_WIDGET (native),
+				     &GRAPHENE_POINT_INIT (0, 0), &origin))
+	origin = GRAPHENE_POINT_INIT (0, 0);
+    }
+
+  *x = lrint (((double) origin.x + tx) * scale);
+  *y = lrint (((double) origin.y + ty) * scale);
+}
+
+/* Convert SX and SY, coordinates relative to the surface F is displayed
+   on in logical pixels, to frame pixel coordinates.  */
+
+static void
+pgtk_surface_to_frame_coords (struct frame *f, double sx, double sy,
+			      int *x, int *y)
+{
+  int ox, oy;
+  double scale = FRAME_GTK_SCALE (f);
+
+  pgtk_frame_device_origin (f, &ox, &oy);
+  *x = floor (sx * scale - ox);
+  *y = floor (sy * scale - oy);
+}
+
+/* Convert WX and WY, coordinates relative to the edit widget of F in
+   logical pixels, to frame pixel coordinates.  */
+
+static void
+pgtk_widget_to_frame_coords (struct frame *f, double wx, double wy,
+			     int *x, int *y)
+{
+  GtkWidget *fixed = FRAME_GTK_WIDGET (f);
+  GtkNative *native = gtk_widget_get_native (fixed);
+  graphene_point_t point = GRAPHENE_POINT_INIT (wx, wy);
+  double tx = 0, ty = 0;
+
+  if (native)
+    {
+      gtk_native_get_surface_transform (native, &tx, &ty);
+      if (!gtk_widget_compute_point (fixed, GTK_WIDGET (native),
+				     &GRAPHENE_POINT_INIT (wx, wy), &point))
+	point = GRAPHENE_POINT_INIT (wx, wy);
+    }
+
+  pgtk_surface_to_frame_coords (f, (double) point.x + tx,
+				(double) point.y + ty, x, y);
+}
+
+/* Store the position of the pointer when EVENT happened into *X and
+   *Y, in frame pixel coordinates relative to F.  GDK 4 doesn't record
+   the position in all events, such as scroll events; in that case use
+   the current position of the pointer.  */
+
+static void
+pgtk_event_frame_coords (struct frame *f, GdkEvent *event, int *x, int *y)
+{
+  double sx, sy;
+  GdkSurface *surface;
+  GdkDevice *device;
+
+  if (gdk_event_get_position (event, &sx, &sy))
+    {
+      pgtk_surface_to_frame_coords (f, sx, sy, x, y);
+      return;
+    }
+
+  /* The device of the event might be a physical device, whose
+     position GDK doesn't know.  Use the seat's logical pointer.  */
+  surface = gdk_event_get_surface (event);
+  device = gdk_seat_get_pointer (gdk_display_get_default_seat
+				 (FRAME_X_DISPLAY (f)));
+
+  if (surface && device
+      && gdk_surface_get_device_position (surface, device, &sx, &sy, NULL)
+      && sx >= 0 && sy >= 0)
+    pgtk_surface_to_frame_coords (f, sx, sy, x, y);
+  else
+    {
+      *x = FRAME_DISPLAY_INFO (f)->last_mouse_motion_x;
+      *y = FRAME_DISPLAY_INFO (f)->last_mouse_motion_y;
+    }
+}
+#endif
 
 void
 pgtk_set_parent_frame (struct frame *f, Lisp_Object new_value,
@@ -979,6 +1366,57 @@ pgtk_set_parent_frame (struct frame *f, Lisp_Object new_value,
 
       GtkWidget *fixed = FRAME_GTK_WIDGET (f);
 
+#ifdef HAVE_GTK4
+      int width = gtk_widget_get_width (fixed);
+      int height = gtk_widget_get_height (fixed);
+
+      g_object_ref (fixed);
+
+      {
+	GtkWidget *parent = gtk_widget_get_parent (fixed);
+
+	if (FRAME_GTK_OUTER_WIDGET (f))
+	  {
+	    gtk_box_remove (GTK_BOX (parent), fixed);
+	    free_frame_tool_bar (f);
+	    g_clear_object (&FRAME_OUTPUT_DATA (f)->toolbar_widget);
+	    gtk_window_destroy (GTK_WINDOW (FRAME_GTK_OUTER_WIDGET (f)));
+	    FRAME_GTK_OUTER_WIDGET (f) = NULL;
+	    FRAME_OUTPUT_DATA (f)->vbox_widget = NULL;
+	    FRAME_OUTPUT_DATA (f)->hbox_widget = NULL;
+	    FRAME_OUTPUT_DATA (f)->menubar_widget = NULL;
+	    FRAME_MENUBAR_HEIGHT (f) = 0;
+	  }
+	else if (parent)
+	  emacs_fixed_remove (parent, fixed);
+      }
+
+      if (p == NULL)
+	{
+	  /* The edit widget is sized in device pixels of the parent;
+	     keep its size in logical pixels.  */
+	  xg_create_frame_outer_widgets (f);
+	  pgtk_set_event_handler (f);
+	  gtk_box_append (GTK_BOX (f->output_data.pgtk->hbox_widget), fixed);
+	  f->output_data.pgtk->preferred_width = width;
+	  f->output_data.pgtk->preferred_height = height;
+	  gtk_window_present (GTK_WINDOW (FRAME_GTK_OUTER_WIDGET (f)));
+	}
+      else
+	{
+	  GtkWidget *fixed_of_p = FRAME_GTK_WIDGET (p);
+	  emacs_fixed_put (fixed_of_p, fixed,
+			   PGTK_TO_LOGICAL (p, f->left_pos),
+			   PGTK_TO_LOGICAL (p, f->top_pos));
+	  gtk_widget_set_visible (fixed, TRUE);
+	  pgtk_update_frame_scale (f);
+	}
+
+      g_object_unref (fixed);
+      unblock_input ();
+      fset_parent_frame (f, new_value);
+      return;
+#else
       GtkAllocation alloc;
       gtk_widget_get_allocation (fixed, &alloc);
       g_object_ref (fixed);
@@ -1054,6 +1492,7 @@ pgtk_set_parent_frame (struct frame *f, Lisp_Object new_value,
       unblock_input ();
 
       fset_parent_frame (f, new_value);
+#endif
     }
 }
 
@@ -1082,6 +1521,21 @@ pgtk_set_z_group (struct frame *f, Lisp_Object new_value, Lisp_Object old_value)
 {
   if (!FRAME_GTK_OUTER_WIDGET (f))
     return;
+
+#ifdef HAVE_GTK4
+  /* GTK 4 cannot keep windows above or below others; just record the
+     z-group.  */
+  if (NILP (new_value))
+    FRAME_Z_GROUP (f) = z_group_none;
+  else if (EQ (new_value, Qabove))
+    FRAME_Z_GROUP (f) = z_group_above;
+  else if (EQ (new_value, Qabove_suspended))
+    FRAME_Z_GROUP (f) = z_group_above_suspended;
+  else if (EQ (new_value, Qbelow))
+    FRAME_Z_GROUP (f) = z_group_below;
+  else
+    error ("Invalid z-group specification");
+#else
 
   if (NILP (new_value))
     {
@@ -1115,6 +1569,7 @@ pgtk_set_z_group (struct frame *f, Lisp_Object new_value, Lisp_Object old_value)
     }
   else
     error ("Invalid z-group specification");
+#endif
 }
 
 static void
@@ -2834,8 +3289,12 @@ static void
 pgtk_define_frame_cursor (struct frame *f, Emacs_Cursor cursor)
 {
   if (!f->pointer_invisible && FRAME_X_OUTPUT (f)->current_cursor != cursor)
+#ifndef HAVE_GTK4
     gdk_window_set_cursor (gtk_widget_get_window (FRAME_GTK_WIDGET (f)),
 			   cursor);
+#else
+    pgtk_set_frame_cursor (f, cursor);
+#endif
   FRAME_X_OUTPUT (f)->current_cursor = cursor;
 }
 
@@ -3338,7 +3797,9 @@ pgtk_text_icon (struct frame *f, const char *icon_name)
 {
   if (FRAME_GTK_OUTER_WIDGET (f))
     {
+#ifndef HAVE_GTK4
       gtk_window_set_icon (GTK_WINDOW (FRAME_GTK_OUTER_WIDGET (f)), NULL);
+#endif
       gtk_window_set_title (GTK_WINDOW (FRAME_GTK_OUTER_WIDGET (f)), icon_name);
     }
 
@@ -3499,7 +3960,9 @@ pgtk_mouse_position (struct frame **fp, int insist, Lisp_Object * bar_window,
   GdkSeat *seat;
   GdkDevice *device;
   GdkModifierType mask;
+#ifndef HAVE_GTK4
   GdkWindow *win;
+#endif
   bool return_frame_flag = false;
 
   block_input ();
@@ -3514,6 +3977,62 @@ pgtk_mouse_position (struct frame **fp, int insist, Lisp_Object * bar_window,
 
   dpyinfo->last_mouse_scroll_bar = NULL;
 
+#ifdef HAVE_GTK4
+  /* GTK 4 cannot tell which surface the pointer is in, so use the
+     frame where the mouse last moved.  */
+  if (gui_mouse_grabbed (dpyinfo)
+      && (!EQ (track_mouse, Qdropping)
+	  && !EQ (track_mouse, Qdrag_source)))
+    f1 = dpyinfo->last_mouse_frame;
+  else
+    f1 = dpyinfo->last_mouse_motion_frame;
+
+  if (f1 == NULL || !FRAME_LIVE_P (f1) || !FRAME_PGTK_P (f1)
+      || !FRAME_GDK_SURFACE (f1))
+    {
+      f1 = SELECTED_FRAME ();
+
+      if (!FRAME_PGTK_P (f1))
+	f1 = dpyinfo->last_mouse_frame;
+
+      return_frame_flag = EQ (track_mouse, Qdrag_source);
+    }
+
+  if (f1 == NULL || !FRAME_LIVE_P (f1) || !FRAME_PGTK_P (f1)
+      || !FRAME_GDK_SURFACE (f1))
+    {
+      unblock_input ();
+      return;
+    }
+
+  {
+    double sx, sy;
+
+    seat = gdk_display_get_default_seat (dpyinfo->gdpy);
+    device = gdk_seat_get_pointer (seat);
+    if (gdk_surface_get_device_position (FRAME_GDK_SURFACE (f1), device,
+					 &sx, &sy, &mask))
+      pgtk_surface_to_frame_coords (f1, sx, sy, &win_x, &win_y);
+    else
+      {
+	win_x = dpyinfo->last_mouse_motion_x;
+	win_y = dpyinfo->last_mouse_motion_y;
+      }
+  }
+
+  remember_mouse_glyph (f1, win_x, win_y, &dpyinfo->last_mouse_glyph);
+  dpyinfo->last_mouse_glyph_frame = f1;
+
+  *bar_window = Qnil;
+  *part = 0;
+  *fp = !return_frame_flag ? f1 : NULL;
+  XSETINT (*x, win_x);
+  XSETINT (*y, win_y);
+  *timestamp = dpyinfo->last_mouse_movement_time;
+
+  unblock_input ();
+  return;
+#else
   if (gui_mouse_grabbed (dpyinfo)
       && (!EQ (track_mouse, Qdropping)
 	  && !EQ (track_mouse, Qdrag_source)))
@@ -3568,6 +4087,7 @@ pgtk_mouse_position (struct frame **fp, int insist, Lisp_Object * bar_window,
     }
 
   unblock_input ();
+#endif
 }
 
 /* Fringe bitmaps.  */
@@ -3705,6 +4225,11 @@ static void
 pgtk_show_hourglass (struct frame *f)
 {
   struct pgtk_output *x = FRAME_X_OUTPUT (f);
+
+#ifdef HAVE_GTK4
+  /* Just show the hourglass cursor in the edit widget.  */
+  pgtk_set_frame_cursor (f, x->hourglass_cursor);
+#else
   if (x->hourglass_widget != NULL)
     gtk_widget_destroy (x->hourglass_widget);
 
@@ -3717,6 +4242,7 @@ pgtk_show_hourglass (struct frame *f)
   gdk_window_raise (gtk_widget_get_window (x->hourglass_widget));
   gdk_window_set_cursor (gtk_widget_get_window (x->hourglass_widget),
 			 x->hourglass_cursor);
+#endif
 
   /* For cursor animation, we receive signals, set pending_signals,
      and wait for the signal handler to run.  */
@@ -3742,17 +4268,31 @@ pgtk_hide_hourglass (struct frame *f)
 	  hourglass_atimer = NULL;
 	}
     }
+#ifndef HAVE_GTK4
   if (x->hourglass_widget != NULL)
     {
       gtk_widget_destroy (x->hourglass_widget);
       x->hourglass_widget = NULL;
     }
+#else
+  pgtk_set_frame_cursor (f, (f->pointer_invisible
+			     ? FRAME_DISPLAY_INFO (f)->invisible_cursor
+			     : x->current_cursor));
+#endif
 }
 
 /* Flushes changes to display.  */
 static void
 pgtk_flush_display (struct frame *f)
 {
+#ifdef HAVE_GTK4
+  /* The contents of the frame are copied to a texture when the edit
+     widget is drawn, so make sure that happens if anything was drawn
+     outside a normal redisplay.  */
+  if (!FRAME_X_OUTPUT (f)->texture && FRAME_GTK_WIDGET (f)
+      && !buffer_flipping_blocked_p ())
+    gtk_widget_queue_draw (FRAME_GTK_WIDGET (f));
+#endif
 }
 
 extern frame_parm_handler pgtk_frame_parm_handlers[];
@@ -3814,6 +4354,11 @@ recover_from_visible_bell (struct atimer *timer)
 
   if (FRAME_X_OUTPUT (f)->atimer_visible_bell != NULL)
     FRAME_X_OUTPUT (f)->atimer_visible_bell = NULL;
+
+#ifdef HAVE_GTK4
+  if (FRAME_GTK_WIDGET (f))
+    gtk_widget_queue_draw (FRAME_GTK_WIDGET (f));
+#endif
 }
 
 /* Invert the middle quarter of the frame for .15 sec.  */
@@ -3905,6 +4450,9 @@ pgtk_flash (struct frame *f)
 
 
   cairo_destroy (cr);
+#ifdef HAVE_GTK4
+  gtk_widget_queue_draw (FRAME_GTK_WIDGET (f));
+#endif
   unblock_input ();
 }
 
@@ -4002,6 +4550,8 @@ pgtk_send_scroll_bar_event (Lisp_Object window, enum scroll_bar_part part,
 }
 
 
+#ifndef HAVE_GTK4
+
 /* Scroll bar callback for GTK scroll bars.  WIDGET is the scroll
    bar widget.  DATA is a pointer to the scroll_bar structure. */
 
@@ -4088,6 +4638,67 @@ xg_end_scroll_callback (GtkWidget *widget,
 
   return false;
 }
+
+#else /* HAVE_GTK4 */
+
+/* Callback for button release in a scroll bar.  Sets dragging to -1
+   when dragging is done.  */
+
+static void
+xg_end_scroll_callback (GtkWidget *widget, gpointer user_data)
+{
+  struct scroll_bar *bar = user_data;
+  bar->dragging = -1;
+  if (WINDOWP (window_being_scrolled))
+    {
+      pgtk_send_scroll_bar_event (window_being_scrolled,
+				  scroll_bar_end_scroll, 0, 0,
+				  bar->horizontal);
+      window_being_scrolled = Qnil;
+    }
+}
+
+/* Scroll bar callback for GTK scroll bars, called when the value of
+   ADJ, the adjustment of a scroll bar, changes.  USER_DATA is a
+   pointer to the scroll_bar structure.
+
+   GTK 4 doesn't say how the value was changed, so everything is
+   reported as a movement of the handle.  */
+
+static void
+xg_scroll_callback (GtkAdjustment *adj, gpointer user_data)
+{
+  struct scroll_bar *bar = user_data;
+  int whole, portion;
+  enum scroll_bar_part part;
+  GtkWidget *wscroll;
+
+  if (xg_ignore_gtk_scrollbar)
+    return;
+
+  whole = (gtk_adjustment_get_upper (adj)
+	   - gtk_adjustment_get_page_size (adj));
+  portion = min ((int) gtk_adjustment_get_value (adj), whole);
+  part = (bar->horizontal
+	  ? scroll_bar_horizontal_handle : scroll_bar_handle);
+
+  window_being_scrolled = bar->window;
+  pgtk_send_scroll_bar_event (bar->window, part, portion, whole,
+			      bar->horizontal);
+
+  /* If no mouse button is held down, the value changed due to a
+     scroll wheel or keyboard event, so the scroll is already over.
+     Otherwise the handle is being dragged, and the button release is
+     reported by xg_end_scroll_callback.  */
+  wscroll = g_object_get_data (G_OBJECT (adj), "emacs-scrollbar");
+
+  if (wscroll && g_object_get_data (G_OBJECT (wscroll), "emacs-pressed"))
+    bar->dragging = portion;
+  else
+    xg_end_scroll_callback (NULL, bar);
+}
+
+#endif /* HAVE_GTK4 */
 
 #define SCROLL_BAR_NAME "verticalScrollBar"
 #define SCROLL_BAR_HORIZONTAL_NAME "horizontalScrollBar"
@@ -4577,6 +5188,9 @@ pgtk_delete_terminal (struct terminal *terminal)
   block_input ();
 
   pgtk_im_finish (dpyinfo);
+#ifdef HAVE_GTK4
+  pgtk_selection_finish (dpyinfo);
+#endif
 
   /* Normally, the display is available...  */
   if (dpyinfo->gdpy)
@@ -4589,7 +5203,11 @@ pgtk_delete_terminal (struct terminal *terminal)
       g_clear_object (&dpyinfo->invisible_cursor);
       if (dpyinfo->last_click_event != NULL)
 	{
+#ifndef HAVE_GTK4
 	  gdk_event_free (dpyinfo->last_click_event);
+#else
+	  gdk_event_unref (dpyinfo->last_click_event);
+#endif
 	  dpyinfo->last_click_event = NULL;
 	}
 
@@ -4663,6 +5281,7 @@ pgtk_focus_frame (struct frame *f, bool noactivate)
     gtk_widget_grab_focus (widget);
 }
 
+#ifndef HAVE_GTK4
 static void
 set_opacity_recursively (GtkWidget *w, gpointer data)
 {
@@ -4672,6 +5291,7 @@ set_opacity_recursively (GtkWidget *w, gpointer data)
     gtk_container_foreach (GTK_CONTAINER (w),
 			   set_opacity_recursively, data);
 }
+#endif
 
 static void
 pgtk_set_frame_alpha (struct frame *f)
@@ -4698,14 +5318,25 @@ pgtk_set_frame_alpha (struct frame *f)
   else if (alpha < alpha_min && alpha_min <= 1.0)
     alpha = alpha_min;
 
+#ifndef HAVE_GTK4
   set_opacity_recursively (FRAME_WIDGET (f), &alpha);
   /* without this, blending mode is strange on wayland. */
   gtk_widget_queue_resize_no_redraw (FRAME_WIDGET (f));
+#else
+  /* The opacity of a widget applies to all of its children.  */
+  gtk_widget_set_opacity (FRAME_WIDGET (f), alpha);
+#endif
 }
 
 static void
 frame_highlight (struct frame *f)
 {
+#ifdef HAVE_GTK4
+  /* GTK 4 windows have no decoration node to draw a border with;
+     frames draw their own borders.  */
+  gui_update_cursor (f, true);
+  pgtk_set_frame_alpha (f);
+#else
   block_input ();
   GtkWidget *w = FRAME_WIDGET (f);
 
@@ -4732,11 +5363,16 @@ frame_highlight (struct frame *f)
   unblock_input ();
   gui_update_cursor (f, true);
   pgtk_set_frame_alpha (f);
+#endif
 }
 
 static void
 frame_unhighlight (struct frame *f)
 {
+#ifdef HAVE_GTK4
+  gui_update_cursor (f, true);
+  pgtk_set_frame_alpha (f);
+#else
   GtkWidget *w;
   char *css;
   GtkStyleContext *ctxt;
@@ -4767,6 +5403,7 @@ frame_unhighlight (struct frame *f)
   unblock_input ();
   gui_update_cursor (f, true);
   pgtk_set_frame_alpha (f);
+#endif
 }
 
 
@@ -4820,8 +5457,12 @@ pgtk_toggle_invisible_pointer (struct frame *f, bool invisible)
     cursor = FRAME_DISPLAY_INFO (f)->invisible_cursor;
   else
     cursor = f->output_data.pgtk->current_cursor;
+#ifndef HAVE_GTK4
   gdk_window_set_cursor (gtk_widget_get_window (FRAME_GTK_WIDGET (f)),
 			 cursor);
+#else
+  pgtk_set_frame_cursor (f, cursor);
+#endif
   f->pointer_invisible = invisible;
 
   /* This is needed to make the pointer visible upon receiving a
@@ -4847,6 +5488,7 @@ pgtk_new_focus_frame (struct pgtk_display_info *dpyinfo, struct frame *frame)
          the correct value of x_focus_frame.  */
       dpyinfo->x_focus_frame = frame;
 
+#ifndef HAVE_GTK4
       if (old_focus && old_focus->auto_lower)
 	if (FRAME_GTK_OUTER_WIDGET (old_focus))
 	  gdk_window_lower (gtk_widget_get_window
@@ -4856,6 +5498,13 @@ pgtk_new_focus_frame (struct pgtk_display_info *dpyinfo, struct frame *frame)
 	if (FRAME_GTK_OUTER_WIDGET (dpyinfo->x_focus_frame))
 	  gdk_window_raise (gtk_widget_get_window
 			    (FRAME_GTK_OUTER_WIDGET (dpyinfo->x_focus_frame)));
+#else
+      if (old_focus && old_focus->auto_lower)
+	pgtk_lower_frame (old_focus);
+
+      if (dpyinfo->x_focus_frame && dpyinfo->x_focus_frame->auto_raise)
+	pgtk_raise_frame (dpyinfo->x_focus_frame);
+#endif
     }
 
   pgtk_frame_rehighlight (dpyinfo);
@@ -4927,6 +5576,7 @@ pgtk_create_terminal (struct pgtk_display_info *dpyinfo)
   return terminal;
 }
 
+#ifndef HAVE_GTK4
 struct pgtk_window_is_of_frame_recursive_t
 {
   GdkWindow *window;
@@ -5035,6 +5685,8 @@ pgtk_handle_event (GtkWidget *widget, GdkEvent *event, gpointer *data)
   return FALSE;
 }
 
+#endif /* !HAVE_GTK4 */
+
 static void
 pgtk_fill_rectangle (struct frame *f, unsigned long color, int x, int y,
 		     int width, int height, bool respect_alpha_background)
@@ -5096,6 +5748,7 @@ pgtk_clear_under_internal_border (struct frame *f)
     }
 }
 
+#ifndef HAVE_GTK4
 static gboolean
 pgtk_handle_draw (GtkWidget *widget, cairo_t *cr, gpointer *data)
 {
@@ -5137,6 +5790,8 @@ size_allocate (GtkWidget *widget, GtkAllocation *alloc,
       pgtk_cr_update_surface_desired_size (f, alloc->width, alloc->height, false);
     }
 }
+
+#endif /* !HAVE_GTK4 */
 
 static void
 get_modifier_values (int *mod_ctrl, int *mod_meta, int *mod_alt,
@@ -5274,6 +5929,7 @@ pgtk_enqueue_preedit (struct frame *f, Lisp_Object preedit)
   evq_enqueue (&inev);
 }
 
+#ifndef HAVE_GTK4
 static gboolean
 key_press_event (GtkWidget *widget, GdkEvent *event, gpointer *user_data)
 {
@@ -5715,6 +6371,8 @@ delete_event (GtkWidget *widget,
   return TRUE;
 }
 
+#endif /* !HAVE_GTK4 */
+
 /* The focus may have changed.  Figure out if it is a real focus change,
    by checking both FocusIn/Out and Enter/LeaveNotify events.
 
@@ -5770,6 +6428,7 @@ pgtk_focus_changed (gboolean is_enter, int state,
     }
 }
 
+#ifndef HAVE_GTK4
 static gboolean
 enter_notify_event (GtkWidget *widget, GdkEvent *event,
 		    gpointer *user_data)
@@ -6365,7 +7024,9 @@ scroll_event (GtkWidget *widget, GdkEvent *event, gpointer *user_data)
   return TRUE;
 }
 
-
+#endif /* !HAVE_GTK4 */
+
+
 
 /* C part of drop handling code.
    The Lisp part is in pgtk-dnd.el.  */
@@ -6382,11 +7043,16 @@ symbol_to_drag_action (Lisp_Object act)
   if (EQ (act, Qlink))
     return GDK_ACTION_LINK;
 
+#ifndef HAVE_GTK4
   if (EQ (act, Qprivate))
     return GDK_ACTION_PRIVATE;
 
   if (NILP (act))
     return GDK_ACTION_DEFAULT;
+#else
+  if (EQ (act, Qprivate) || NILP (act))
+    return 0;
+#endif
 
   signal_error ("Invalid drag action", act);
 }
@@ -6405,15 +7071,18 @@ drag_action_to_symbol (GdkDragAction action)
     case GDK_ACTION_LINK:
       return Qlink;
 
+#ifndef HAVE_GTK4
     case GDK_ACTION_PRIVATE:
       return Qprivate;
 
     case GDK_ACTION_DEFAULT:
+#endif
     default:
       return Qnil;
     }
 }
 
+#ifndef HAVE_GTK4
 void
 pgtk_update_drop_status (Lisp_Object action, Lisp_Object event_time)
 {
@@ -6580,7 +7249,9 @@ drag_drop (GtkWidget *widget, GdkDragContext *context,
   return TRUE;
 }
 
-
+#endif /* !HAVE_GTK4 */
+
+
 
 /* Touch screen events.  */
 
@@ -6695,6 +7366,7 @@ pgtk_find_touch_point (struct pgtk_display_info *dpyinfo,
   return NULL;
 }
 
+#ifndef HAVE_GTK4
 static gboolean
 touch_event_cb (GtkWidget *self, GdkEvent *event, gpointer user_data)
 {
@@ -6906,6 +7578,1497 @@ pgtk_set_event_handler (struct frame *f)
 		    G_CALLBACK (pgtk_handle_event), NULL);
 }
 
+#endif /* !HAVE_GTK4 */
+
+#ifdef HAVE_GTK4
+
+/***********************************************************************
+			  GTK 4 event handling
+ ***********************************************************************/
+
+/* Under GTK 4, events are received through event controllers attached
+   to the edit widget of each frame.  Most of them are delivered to a
+   legacy event controller, which receives raw GdkEvents and so allows
+   handling them much as under GTK 3.  The controller only handles
+   events targeting the edit widget itself, so events for scroll bars
+   and child frames are not seen by the edit widgets of their
+   parents.
+
+   Positions in GDK events are relative to the surface they are
+   delivered to, in logical pixels; pgtk_surface_to_frame_coords
+   converts them to Emacs pixels.  */
+
+/* Draw the contents of frame F, whose edit widget is WIDGET, into
+   SNAPSHOT.  */
+
+void
+pgtk_snapshot_frame (struct frame *f, GtkWidget *widget,
+		     GtkSnapshot *snapshot)
+{
+  struct pgtk_output *x = FRAME_X_OUTPUT (f);
+  cairo_surface_t *src = x->cr_surface_visible_bell;
+  GdkTexture *texture;
+  double scale = FRAME_GTK_SCALE (f);
+  int ox, oy;
+  graphene_point_t origin;
+  GtkNative *native;
+  double tx = 0, ty = 0;
+
+  if (!src && FRAME_CR_ACTIVE_CONTEXT (f))
+    src = cairo_get_target (FRAME_CR_ACTIVE_CONTEXT (f));
+
+  if (!src)
+    return;
+
+  /* The contents of the Cairo surface are copied into a texture,
+     which is kept until something is drawn to the surface.  */
+  if (src == x->cr_surface_visible_bell)
+    texture = xg_texture_from_surface (src);
+  else
+    {
+      if (!x->texture)
+	x->texture = xg_texture_from_surface (src);
+      texture = g_object_ref (x->texture);
+    }
+
+  /* Emacs draws in device pixels, so draw the texture at 1/SCALE of
+     its size.  To prevent GTK from resampling it, which would make it
+     blurry, place it so that its pixels coincide with those of the
+     surface: the origin of the widget might fall in the middle of a
+     device pixel.  */
+  native = gtk_widget_get_native (widget);
+  origin = GRAPHENE_POINT_INIT (0, 0);
+  if (native)
+    {
+      gtk_native_get_surface_transform (native, &tx, &ty);
+      if (!gtk_widget_compute_point (widget, GTK_WIDGET (native),
+				     &GRAPHENE_POINT_INIT (0, 0), &origin))
+	origin = GRAPHENE_POINT_INIT (0, 0);
+    }
+  pgtk_frame_device_origin (f, &ox, &oy);
+
+  gtk_snapshot_save (snapshot);
+  gtk_snapshot_translate (snapshot,
+			  &GRAPHENE_POINT_INIT ((float) (ox / scale
+							 - (double) origin.x
+							 - tx),
+						(float) (oy / scale
+							 - (double) origin.y
+							 - ty)));
+  gtk_snapshot_append_texture (snapshot, texture,
+			       &GRAPHENE_RECT_INIT
+			       (0, 0, gdk_texture_get_width (texture) / scale,
+				gdk_texture_get_height (texture) / scale));
+  gtk_snapshot_restore (snapshot);
+  g_object_unref (texture);
+}
+
+/* Return the resolution of frame F, in device pixels per inch.  */
+
+double
+pgtk_frame_resolution (struct frame *f)
+{
+  double resolution = FRAME_X_OUTPUT (f)->resolution;
+
+  return resolution > 0 ? resolution : FRAME_DISPLAY_INFO (f)->resy;
+}
+
+/* Update the resolution of F from its scale.  If it changed, arrange
+   for the fonts of F to be reopened, so that text keeps its size on the
+   screen.  */
+
+static void
+pgtk_update_frame_resolution (struct frame *f)
+{
+  struct pgtk_display_info *dpyinfo = FRAME_DISPLAY_INFO (f);
+  double resolution = dpyinfo->text_resolution * FRAME_GTK_SCALE (f);
+  Lisp_Object frame;
+
+  if (resolution == pgtk_frame_resolution (f))
+    return;
+
+  FRAME_X_OUTPUT (f)->resolution = resolution;
+
+  /* The fonts are reopened by Lisp, which can't be run here.  GTK can
+     change the scale more than once while a frame is first shown, so
+     the function checks whether that is still needed.  */
+  if (!f->tooltip && FRAME_FONT (f) && !FRAME_X_OUTPUT (f)->rescale_pending)
+    {
+      FRAME_X_OUTPUT (f)->rescale_pending = true;
+      XSETFRAME (frame, f);
+      pending_funcalls
+	= Fcons (list2 (Qpgtk__frame_resolution_changed, frame),
+		 pending_funcalls);
+    }
+}
+
+DEFUN ("pgtk-frame-resolution", Fpgtk_frame_resolution,
+       Spgtk_frame_resolution, 0, 1, 0,
+       doc: /* Return the resolution of FRAME, in pixels per inch.
+FRAME must be a live frame and defaults to the selected one.  Frames
+displayed on monitors with different scale factors have different
+resolutions.  */)
+  (Lisp_Object frame)
+{
+  struct frame *f = decode_window_system_frame (frame);
+
+  /* The fonts of F are being reopened.  */
+  FRAME_X_OUTPUT (f)->rescale_pending = false;
+  return make_float (pgtk_frame_resolution (f));
+}
+
+/* Update the scale of frame F from the surface it is displayed on.  */
+
+void
+pgtk_update_frame_scale (struct frame *f)
+{
+  GdkSurface *surface = FRAME_GDK_SURFACE (f);
+  GtkWidget *fixed = FRAME_GTK_WIDGET (f);
+  double scale;
+  int width, height;
+
+  if (!surface)
+    return;
+
+  scale = gdk_surface_get_scale (surface);
+  if (scale <= 0 || scale == FRAME_GTK_SCALE (f))
+    return;
+
+  FRAME_GTK_SCALE (f) = scale;
+
+  /* The size of the frame in device pixels changed.  */
+  width = gtk_widget_get_width (fixed);
+  height = gtk_widget_get_height (fixed);
+  if (width > 0 && height > 0)
+    {
+      int dwidth = lrint (width * scale);
+      int dheight = lrint (height * scale);
+
+      xg_frame_resized (f, dwidth, dheight);
+      pgtk_cr_update_surface_desired_size (f, dwidth, dheight, false);
+    }
+
+  /* So did the size of the widgets around it, and that of text.  */
+  xg_frame_scale_changed (f);
+  pgtk_update_frame_resolution (f);
+  pgtk_set_scroll_bar_default_width (f);
+  pgtk_set_scroll_bar_default_height (f);
+  SET_FRAME_GARBAGED (f);
+}
+
+/* Called when the edit widget of F has been allocated WIDTH by HEIGHT
+   logical pixels.  */
+
+void
+pgtk_edit_widget_allocated (struct frame *f, int width, int height)
+{
+  int dwidth, dheight;
+
+  pgtk_update_frame_scale (f);
+
+  dwidth = lrint (width * FRAME_GTK_SCALE (f));
+  dheight = lrint (height * FRAME_GTK_SCALE (f));
+  xg_frame_resized (f, dwidth, dheight);
+  pgtk_cr_update_surface_desired_size (f, dwidth, dheight, false);
+}
+
+/* Handle the key press EVENT on frame F.  */
+
+static gboolean
+pgtk_key_press (struct frame *f, GdkEvent *event)
+{
+  union buffered_input_event inev;
+  ptrdiff_t nbytes = 0;
+  Mouse_HLInfo *hlinfo = MOUSE_HL_INFO (f);
+  struct pgtk_display_info *dpyinfo = FRAME_DISPLAY_INFO (f);
+  guint keysym, orig_keysym;
+  char copy_buffer[8];
+  int modifiers;
+  Lisp_Object c;
+  guint state;
+  gunichar uc;
+
+  EVENT_INIT (inev.ie);
+
+  /* If mouse-highlight is an integer, input clears out
+     mouse highlighting.  */
+  if (!hlinfo->mouse_face_hidden && INTEGERP (Vmouse_highlight))
+    {
+      clear_mouse_face (hlinfo);
+      hlinfo->mouse_face_hidden = true;
+    }
+
+  /* Set the last user time for pgtk_focus_frame to work
+     correctly.  */
+  dpyinfo->last_user_time = gdk_event_get_time (event);
+
+  state = gdk_event_get_modifier_state (event);
+
+  /* While super is pressed, the input method will always always
+     resend the key events ignoring super.  As a workaround, don't
+     filter key events with super or hyper pressed.  */
+  if (!(state & (GDK_SUPER_MASK | GDK_HYPER_MASK)))
+    {
+      if (pgtk_im_filter_keypress (f, event))
+	return TRUE;
+    }
+
+  state |= pgtk_emacs_to_gtk_modifiers (dpyinfo, extra_keyboard_modifiers);
+  modifiers = state;
+
+  keysym = gdk_key_event_get_keyval (event);
+  orig_keysym = keysym;
+
+  /* GDK 4 key events have no string.  Compute it from the keysym.  */
+  uc = gdk_keyval_to_unicode (keysym);
+  if (uc && !g_unichar_iscntrl (uc))
+    nbytes = g_unichar_to_utf8 (uc, copy_buffer);
+
+  /* Common for all keysym input events.  */
+  XSETFRAME (inev.ie.frame_or_window, f);
+  inev.ie.modifiers = pgtk_gtk_to_emacs_modifiers (dpyinfo, modifiers);
+  inev.ie.timestamp = gdk_event_get_time (event);
+  inev.ie.device = pgtk_get_device_for_event (dpyinfo, event);
+
+  /* First deal with keysyms which have defined
+     translations to characters.  */
+  if (keysym >= 32 && keysym < 128)
+    /* Avoid explicitly decoding each ASCII character.  */
+    {
+      inev.ie.kind = ASCII_KEYSTROKE_EVENT;
+      inev.ie.code = keysym;
+      goto done;
+    }
+
+  /* Keysyms directly mapped to Unicode characters.  */
+  if (keysym >= 0x01000000 && keysym <= 0x0110FFFF)
+    {
+      if (keysym < 0x01000080)
+	inev.ie.kind = ASCII_KEYSTROKE_EVENT;
+      else
+	inev.ie.kind = MULTIBYTE_CHAR_KEYSTROKE_EVENT;
+      inev.ie.code = keysym & 0xFFFFFF;
+      goto done;
+    }
+
+  /* Now non-ASCII.  */
+  if (HASH_TABLE_P (Vpgtk_keysym_table)
+      && (c = Fgethash (make_fixnum (keysym),
+			Vpgtk_keysym_table, Qnil), FIXNATP (c)))
+    {
+      inev.ie.kind = (SINGLE_BYTE_CHAR_P (XFIXNAT (c))
+		      ? ASCII_KEYSTROKE_EVENT
+		      : MULTIBYTE_CHAR_KEYSTROKE_EVENT);
+      inev.ie.code = XFIXNAT (c);
+      goto done;
+    }
+
+  /* Random non-modifier sorts of keysyms.  */
+  if (((keysym >= GDK_KEY_BackSpace && keysym <= GDK_KEY_Escape)
+       || keysym == GDK_KEY_Delete
+       || (keysym >= GDK_KEY_ISO_Left_Tab && keysym <= GDK_KEY_ISO_Enter)
+       || IsCursorKey (keysym)	/* 0xff50 <= x < 0xff60 */
+       || IsMiscFunctionKey (keysym)	/* 0xff60 <= x < VARIES */
+#ifdef GDK_KEY_dead_circumflex
+       || orig_keysym == GDK_KEY_dead_circumflex
+#endif
+#ifdef GDK_KEY_dead_grave
+       || orig_keysym == GDK_KEY_dead_grave
+#endif
+#ifdef GDK_KEY_dead_tilde
+       || orig_keysym == GDK_KEY_dead_tilde
+#endif
+#ifdef GDK_KEY_dead_diaeresis
+       || orig_keysym == GDK_KEY_dead_diaeresis
+#endif
+#ifdef GDK_KEY_dead_macron
+       || orig_keysym == GDK_KEY_dead_macron
+#endif
+#ifdef GDK_KEY_dead_degree
+       || orig_keysym == GDK_KEY_dead_degree
+#endif
+#ifdef GDK_KEY_dead_acute
+       || orig_keysym == GDK_KEY_dead_acute
+#endif
+#ifdef GDK_KEY_dead_cedilla
+       || orig_keysym == GDK_KEY_dead_cedilla
+#endif
+#ifdef GDK_KEY_dead_breve
+       || orig_keysym == GDK_KEY_dead_breve
+#endif
+#ifdef GDK_KEY_dead_ogonek
+       || orig_keysym == GDK_KEY_dead_ogonek
+#endif
+#ifdef GDK_KEY_dead_caron
+       || orig_keysym == GDK_KEY_dead_caron
+#endif
+#ifdef GDK_KEY_dead_doubleacute
+       || orig_keysym == GDK_KEY_dead_doubleacute
+#endif
+#ifdef GDK_KEY_dead_abovedot
+       || orig_keysym == GDK_KEY_dead_abovedot
+#endif
+       || IsKeypadKey (keysym)	/* 0xff80 <= x < 0xffbe */
+       || IsFunctionKey (keysym)	/* 0xffbe <= x < 0xffe1 */
+       /* Any "vendor-specific" key is ok.  */
+       || (orig_keysym & (1 << 28))
+       || (keysym != GDK_KEY_VoidSymbol && nbytes == 0))
+      && !(gdk_key_event_is_modifier (event)
+	   || IsModifierKey (orig_keysym)
+	   /* The symbols from GDK_KEY_ISO_Lock
+	      to GDK_KEY_ISO_Last_Group_Lock
+	      don't have real modifiers but
+	      should be treated similarly to
+	      Mode_switch by Emacs. */
+	   || (GDK_KEY_ISO_Lock <= orig_keysym
+	       && orig_keysym <= GDK_KEY_ISO_Last_Group_Lock)))
+    {
+      /* make_lispy_event will convert this to a symbolic
+	 key.  */
+      inev.ie.kind = NON_ASCII_KEYSTROKE_EVENT;
+      inev.ie.code = keysym;
+      goto done;
+    }
+
+  if (nbytes > 0)
+    {
+      inev.ie.kind = MULTIBYTE_CHAR_KEYSTROKE_EVENT;
+      inev.ie.arg = make_unibyte_string (copy_buffer, nbytes);
+    }
+
+ done:
+  if (inev.ie.kind != NO_EVENT)
+    evq_enqueue (&inev);
+
+  return TRUE;
+}
+
+/* Function to report a mouse movement to the mainstream Emacs code.
+
+   The mouse moved to X, Y (in frame pixels) on FRAME, at TIME, as
+   reported by EVENT.  If the mouse is over a different glyph than it
+   was last time, tell the mainstream emacs code by setting
+   mouse_moved.  */
+
+static bool
+pgtk_note_mouse_movement (struct frame *frame, int x, int y,
+			  guint32 time, GdkEvent *event)
+{
+  XRectangle *r;
+  struct pgtk_display_info *dpyinfo;
+
+  if (!FRAME_X_OUTPUT (frame))
+    return false;
+
+  dpyinfo = FRAME_DISPLAY_INFO (frame);
+  dpyinfo->last_mouse_movement_time = time;
+  dpyinfo->last_mouse_motion_frame = frame;
+  dpyinfo->last_mouse_motion_x = x;
+  dpyinfo->last_mouse_motion_y = y;
+
+  /* Has the mouse moved off the glyph it was on at the last sighting?  */
+  r = &dpyinfo->last_mouse_glyph;
+  if (frame != dpyinfo->last_mouse_glyph_frame
+      || x < r->x || x >= r->x + (int) r->width
+      || y < r->y || y >= r->y + (int) r->height)
+    {
+      frame->mouse_moved = true;
+      dpyinfo->last_mouse_scroll_bar = NULL;
+      note_mouse_highlight (frame, x, y);
+      /* Remember which glyph we're now on.  */
+      remember_mouse_glyph (frame, x, y, r);
+      dpyinfo->last_mouse_glyph_frame = frame;
+      frame->last_mouse_device
+	= pgtk_get_device_for_event (dpyinfo, event);
+      return true;
+    }
+
+  return false;
+}
+
+/* Return whether EVENT is a pointer event emulated from a touch screen
+   event.  Such events are ignored, as touch screen events are handled
+   on their own.  */
+
+static bool
+pgtk_event_from_touch_screen_p (GdkEvent *event)
+{
+  GdkDevice *device;
+
+  /* The event must not have emerged from a touch device either, as
+     GDK does not set pointer_emulated in events generated on Wayland
+     as on X, and as the X Input Extension specifies.  */
+  return (gdk_event_get_pointer_emulated (event)
+	  || ((device = gdk_event_get_device (event))
+	      && gdk_device_get_source (device) == GDK_SOURCE_TOUCHSCREEN));
+}
+
+/* Handle the motion EVENT on FRAME.  */
+
+static void
+pgtk_motion (struct frame *frame, GdkEvent *event)
+{
+  union buffered_input_event inev;
+  struct frame *f;
+  struct pgtk_display_info *dpyinfo = FRAME_DISPLAY_INFO (frame);
+  Mouse_HLInfo *hlinfo;
+  int x, y;
+
+  if (pgtk_event_from_touch_screen_p (event))
+    return;
+
+  EVENT_INIT (inev.ie);
+  inev.ie.kind = NO_EVENT;
+  inev.ie.arg = Qnil;
+
+  previous_help_echo_string = help_echo_string;
+  help_echo_string = Qnil;
+
+  f = (gui_mouse_grabbed (dpyinfo) && dpyinfo->last_mouse_frame
+       ? dpyinfo->last_mouse_frame : frame);
+  hlinfo = MOUSE_HL_INFO (f);
+
+  if (hlinfo->mouse_face_hidden)
+    {
+      hlinfo->mouse_face_hidden = false;
+      clear_mouse_face (hlinfo);
+    }
+
+  pgtk_event_frame_coords (f, event, &x, &y);
+
+  /* Maybe generate a SELECT_WINDOW_EVENT for
+     `mouse-autoselect-window' but don't let popup menus
+     interfere with this (Bug#1261).  */
+  if (!NILP (Vmouse_autoselect_window)
+      /* Don't switch if we're currently in the minibuffer.
+	 This tries to work around problems where the
+	 minibuffer gets unselected unexpectedly, and where
+	 you then have to move your mouse all the way down to
+	 the minibuffer to select it.  */
+      && !MINI_WINDOW_P (XWINDOW (selected_window))
+      /* With `focus-follows-mouse' non-nil create an event
+	 also when the target window is on another frame.  */
+      && (f == XFRAME (selected_frame) || !NILP (focus_follows_mouse)))
+    {
+      Lisp_Object window = window_from_coordinates (f, x, y, 0,
+						    false, false, false);
+
+      /* A window will be autoselected only when it is not
+	 selected now and the last mouse movement event was
+	 not in it.  */
+      if (WINDOWP (window)
+	  && !EQ (window, last_mouse_window)
+	  && !EQ (window, selected_window))
+	{
+	  inev.ie.kind = SELECT_WINDOW_EVENT;
+	  inev.ie.frame_or_window = window;
+	}
+
+      /* Remember the last window where we saw the mouse.  */
+      last_mouse_window = window;
+    }
+
+  if (!pgtk_note_mouse_movement (f, x, y, gdk_event_get_time (event), event))
+    help_echo_string = previous_help_echo_string;
+
+  if (inev.ie.kind != NO_EVENT)
+    evq_enqueue (&inev);
+
+  /* If the contents of the global variable help_echo_string
+     has changed, generate a HELP_EVENT.  */
+  if (!NILP (help_echo_string) || !NILP (previous_help_echo_string))
+    {
+      Lisp_Object frame_obj;
+
+      XSETFRAME (frame_obj, f);
+      any_help_event_p = true;
+      gen_help_event (help_echo_string, frame_obj, help_echo_window,
+		      help_echo_object, help_echo_pos);
+    }
+}
+
+/* Handle the button press or release EVENT on FRAME.  */
+
+static void
+pgtk_button (struct frame *frame, GdkEvent *event)
+{
+  union buffered_input_event inev;
+  struct frame *f;
+  struct pgtk_display_info *dpyinfo = FRAME_DISPLAY_INFO (frame);
+  bool tab_bar_p = false;
+  Lisp_Object tab_bar_arg = Qnil;
+  bool press_p = gdk_event_get_event_type (event) == GDK_BUTTON_PRESS;
+  guint button = gdk_button_event_get_button (event);
+  guint32 time = gdk_event_get_time (event);
+  GdkModifierType state = gdk_event_get_modifier_state (event);
+  int x, y;
+
+  if (pgtk_event_from_touch_screen_p (event))
+    return;
+
+  EVENT_INIT (inev.ie);
+  inev.ie.kind = NO_EVENT;
+  inev.ie.arg = Qnil;
+
+  dpyinfo->last_mouse_glyph_frame = NULL;
+
+  if (gui_mouse_grabbed (dpyinfo) && dpyinfo->last_mouse_frame)
+    f = dpyinfo->last_mouse_frame;
+  else
+    {
+      f = frame;
+
+      if (press_p && !FRAME_NO_ACCEPT_FOCUS (f))
+	{
+	  /* When clicking into a child frame or when clicking
+	     into a parent frame with the child frame selected and
+	     `no-accept-focus' is not set, select the clicked
+	     frame.  */
+	  struct frame *hf = dpyinfo->highlight_frame;
+
+	  if (FRAME_PARENT_FRAME (f) || (hf && frame_ancestor_p (f, hf)))
+	    {
+	      block_input ();
+	      gtk_widget_grab_focus (FRAME_GTK_WIDGET (f));
+
+	      if (FRAME_GTK_OUTER_WIDGET (f))
+		gtk_window_present (GTK_WINDOW (FRAME_GTK_OUTER_WIDGET (f)));
+	      unblock_input ();
+	    }
+	}
+    }
+
+  /* Set the last user time, used to activate the frame in
+     pgtk_focus_frame.  */
+  dpyinfo->last_user_time = time;
+
+  pgtk_event_frame_coords (f, event, &x, &y);
+
+  /* Is this in the tab-bar?  */
+  if (WINDOWP (f->tab_bar_window)
+      && WINDOW_TOTAL_LINES (XWINDOW (f->tab_bar_window)))
+    {
+      Lisp_Object window;
+
+      window = window_from_coordinates (f, x, y, 0, true, true, true);
+      tab_bar_p = EQ (window, f->tab_bar_window);
+
+      if (tab_bar_p)
+	tab_bar_arg = handle_tab_bar_click
+	  (f, x, y, press_p, pgtk_gtk_to_emacs_modifiers (dpyinfo, state));
+    }
+
+  if (!(tab_bar_p && NILP (tab_bar_arg)))
+    {
+      bool construct = true;
+
+      if (ignore_next_mouse_click_timeout)
+	{
+	  construct = (press_p && time > ignore_next_mouse_click_timeout);
+	  if (construct || !press_p)
+	    ignore_next_mouse_click_timeout = 0;
+	}
+
+      if (construct)
+	{
+	  inev.ie.kind = MOUSE_CLICK_EVENT;
+	  inev.ie.code = button - 1;
+	  inev.ie.timestamp = time;
+	  inev.ie.modifiers = (pgtk_gtk_to_emacs_modifiers (dpyinfo, state)
+			       | (press_p ? down_modifier : up_modifier));
+	  XSETINT (inev.ie.x, x);
+	  XSETINT (inev.ie.y, y);
+	  XSETFRAME (inev.ie.frame_or_window, f);
+	  inev.ie.device = pgtk_get_device_for_event (dpyinfo, event);
+	}
+
+      if (!NILP (tab_bar_arg))
+	inev.ie.arg = tab_bar_arg;
+    }
+
+  if (press_p)
+    {
+      dpyinfo->grabbed |= (1 << button);
+      dpyinfo->last_mouse_frame = f;
+
+      if (dpyinfo->last_click_event != NULL)
+	gdk_event_unref (dpyinfo->last_click_event);
+      dpyinfo->last_click_event = gdk_event_ref (event);
+    }
+  else
+    dpyinfo->grabbed &= ~(1 << button);
+
+  /* Ignore any mouse motion that happened before this event;
+     any subsequent mouse-movement Emacs events should reflect
+     only motion after the ButtonPress/Release.  */
+  f->mouse_moved = false;
+
+  if (inev.ie.kind != NO_EVENT)
+    evq_enqueue (&inev);
+}
+
+/* Handle the scroll EVENT on FRAME.  */
+
+static void
+pgtk_scroll (struct frame *frame, GdkEvent *event)
+{
+  union buffered_input_event inev;
+  struct frame *f;
+  struct pgtk_display_info *dpyinfo = FRAME_DISPLAY_INFO (frame);
+  GdkScrollDirection dir;
+  double delta_x, delta_y;
+  int x, y;
+
+  EVENT_INIT (inev.ie);
+  inev.ie.kind = NO_EVENT;
+  inev.ie.arg = Qnil;
+
+  if (gui_mouse_grabbed (dpyinfo) && dpyinfo->last_mouse_frame)
+    f = dpyinfo->last_mouse_frame;
+  else
+    f = frame;
+
+  pgtk_event_frame_coords (f, event, &x, &y);
+
+  inev.ie.timestamp = gdk_event_get_time (event);
+  inev.ie.modifiers
+    = pgtk_gtk_to_emacs_modifiers (dpyinfo,
+				   gdk_event_get_modifier_state (event));
+  XSETINT (inev.ie.x, x);
+  XSETINT (inev.ie.y, y);
+  XSETFRAME (inev.ie.frame_or_window, f);
+  inev.ie.arg = Qnil;
+
+  if (gdk_scroll_event_is_stop (event))
+    {
+      inev.ie.kind = TOUCH_END_EVENT;
+      inev.ie.device = pgtk_get_device_for_event (dpyinfo, event);
+      evq_enqueue (&inev);
+      return;
+    }
+
+  dir = gdk_scroll_event_get_direction (event);
+
+  if (dir != GDK_SCROLL_SMOOTH)
+    {
+      switch (dir)
+	{
+	case GDK_SCROLL_UP:
+	  inev.ie.kind = WHEEL_EVENT;
+	  inev.ie.modifiers |= up_modifier;
+	  break;
+	case GDK_SCROLL_DOWN:
+	  inev.ie.kind = WHEEL_EVENT;
+	  inev.ie.modifiers |= down_modifier;
+	  break;
+	case GDK_SCROLL_LEFT:
+	  inev.ie.kind = HORIZ_WHEEL_EVENT;
+	  inev.ie.modifiers |= up_modifier;
+	  break;
+	case GDK_SCROLL_RIGHT:
+	  inev.ie.kind = HORIZ_WHEEL_EVENT;
+	  inev.ie.modifiers |= down_modifier;
+	  break;
+	default:
+	  break;
+	}
+    }
+  else
+    {
+      gdk_scroll_event_get_deltas (event, &delta_x, &delta_y);
+
+      /* Deltas of touchpads and other continuous scroll devices are in
+	 surface pixels under GDK 4, but they were in units ten times as
+	 large under GDK 3, which this code was written for.  */
+      if (gdk_scroll_event_get_unit (event) == GDK_SCROLL_UNIT_SURFACE)
+	{
+	  delta_x /= 10;
+	  delta_y /= 10;
+	}
+
+      if (!mwheel_coalesce_scroll_events)
+	{
+	  inev.ie.kind = ((fabs (delta_x) > fabs (delta_y))
+			  ? HORIZ_WHEEL_EVENT
+			  : WHEEL_EVENT);
+	  inev.ie.modifiers |= (inev.ie.kind == HORIZ_WHEEL_EVENT
+				? (delta_x >= 0 ? up_modifier : down_modifier)
+				: (delta_y >= 0 ? down_modifier : up_modifier));
+	  inev.ie.arg = list3 (Qnil, make_float (-delta_x * 100),
+			       make_float (-delta_y * 100));
+	}
+      else
+	{
+	  dpyinfo->scroll.acc_x += delta_x;
+	  dpyinfo->scroll.acc_y += delta_y;
+	  if (dpyinfo->scroll.acc_y >= dpyinfo->scroll.y_per_line)
+	    {
+	      int nlines = dpyinfo->scroll.acc_y / dpyinfo->scroll.y_per_line;
+	      inev.ie.kind = WHEEL_EVENT;
+	      inev.ie.modifiers |= down_modifier;
+	      inev.ie.arg = list3 (make_fixnum (nlines),
+				   make_float (-dpyinfo->scroll.acc_x * 100),
+				   make_float (-dpyinfo->scroll.acc_y * 100));
+	      dpyinfo->scroll.acc_y -= dpyinfo->scroll.y_per_line * nlines;
+	    }
+	  else if (dpyinfo->scroll.acc_y <= -dpyinfo->scroll.y_per_line)
+	    {
+	      int nlines = -dpyinfo->scroll.acc_y / dpyinfo->scroll.y_per_line;
+	      inev.ie.kind = WHEEL_EVENT;
+	      inev.ie.modifiers |= up_modifier;
+	      inev.ie.arg = list3 (make_fixnum (nlines),
+				   make_float (-dpyinfo->scroll.acc_x * 100),
+				   make_float (-dpyinfo->scroll.acc_y * 100));
+
+	      dpyinfo->scroll.acc_y -= -dpyinfo->scroll.y_per_line * nlines;
+	    }
+	  else if (dpyinfo->scroll.acc_x >= dpyinfo->scroll.x_per_char)
+	    {
+	      int nchars = dpyinfo->scroll.acc_x / dpyinfo->scroll.x_per_char;
+	      inev.ie.kind = HORIZ_WHEEL_EVENT;
+	      inev.ie.modifiers |= up_modifier;
+	      inev.ie.arg = list3 (make_fixnum (nchars),
+				   make_float (-dpyinfo->scroll.acc_x * 100),
+				   make_float (-dpyinfo->scroll.acc_y * 100));
+
+	      dpyinfo->scroll.acc_x -= dpyinfo->scroll.x_per_char * nchars;
+	    }
+	  else if (dpyinfo->scroll.acc_x <= -dpyinfo->scroll.x_per_char)
+	    {
+	      int nchars = -dpyinfo->scroll.acc_x / dpyinfo->scroll.x_per_char;
+	      inev.ie.kind = HORIZ_WHEEL_EVENT;
+	      inev.ie.modifiers |= down_modifier;
+	      inev.ie.arg = list3 (make_fixnum (nchars),
+				   make_float (-dpyinfo->scroll.acc_x * 100),
+				   make_float (-dpyinfo->scroll.acc_y * 100));
+
+	      dpyinfo->scroll.acc_x -= -dpyinfo->scroll.x_per_char * nchars;
+	    }
+	}
+    }
+
+  if (inev.ie.kind != NO_EVENT)
+    {
+      inev.ie.device = pgtk_get_device_for_event (dpyinfo, event);
+      evq_enqueue (&inev);
+    }
+}
+
+/* Handle the touch screen EVENT on F.  */
+
+static gboolean
+pgtk_touch (struct frame *f, GdkEvent *event)
+{
+  struct pgtk_display_info *dpyinfo = FRAME_DISPLAY_INFO (f);
+  EMACS_INT local_detail;
+  union buffered_input_event inev;
+  struct pgtk_touch_point *touchpoint;
+  Lisp_Object arg = Qnil;
+  GdkEventSequence *sequence = gdk_event_get_event_sequence (event);
+  guint32 time = gdk_event_get_time (event);
+  int x, y, state;
+
+  EVENT_INIT (inev.ie);
+
+  pgtk_event_frame_coords (f, event, &x, &y);
+
+  switch (gdk_event_get_event_type (event))
+    {
+    case GDK_TOUCH_BEGIN:
+
+      /* Verify that no touch point with this identifier is already at
+	 large.  */
+      if (pgtk_find_touch_point (dpyinfo, sequence))
+	break;
+
+      /* Record this in the display structure.  */
+      local_detail = pgtk_link_touch_point (dpyinfo, sequence, x, y, f);
+      /* Generate the input event.  */
+      inev.ie.kind = TOUCHSCREEN_BEGIN_EVENT;
+      inev.ie.timestamp = time;
+      XSETFRAME (inev.ie.frame_or_window, f);
+      XSETINT (inev.ie.x, x);
+      XSETINT (inev.ie.y, y);
+      XSETINT (inev.ie.arg, local_detail);
+      break;
+
+    case GDK_TOUCH_UPDATE:
+      touchpoint = pgtk_find_touch_point (dpyinfo, sequence);
+
+      if (!touchpoint
+	  /* Don't send this event if nothing has changed
+	     either.  */
+	  || (touchpoint->x == x && touchpoint->y == y))
+	break;
+
+      /* Construct the input event.  */
+      touchpoint->x = x;
+      touchpoint->y = y;
+      inev.ie.kind = TOUCHSCREEN_UPDATE_EVENT;
+      inev.ie.timestamp = time;
+      XSETFRAME (inev.ie.frame_or_window, f);
+
+      for (touchpoint = dpyinfo->touchpoints;
+	   touchpoint; touchpoint = touchpoint->next)
+	{
+	  if (touchpoint->frame == f)
+	    arg = Fcons (list3i (touchpoint->x, touchpoint->y,
+				 touchpoint->local_detail),
+			 arg);
+	}
+
+      inev.ie.arg = arg;
+      break;
+
+    case GDK_TOUCH_END:
+    case GDK_TOUCH_CANCEL:
+      /* Remove this touch point's record, also establishing its
+	 existence.  */
+      state = pgtk_unlink_touch_point (sequence, dpyinfo, &local_detail);
+      /* If it did exist... */
+      if (state)
+	{
+	  /* ... generate a suitable event.  */
+	  inev.ie.kind = TOUCHSCREEN_END_EVENT;
+	  inev.ie.timestamp = time;
+	  inev.ie.modifiers = (gdk_event_get_event_type (event)
+			       != GDK_TOUCH_END);
+
+	  XSETFRAME (inev.ie.frame_or_window, f);
+	  XSETINT (inev.ie.x, x);
+	  XSETINT (inev.ie.y, y);
+	  XSETINT (inev.ie.arg, local_detail);
+	}
+      break;
+
+    default:
+      break;
+    }
+
+  /* If the above produced a workable event, report the name of the
+     device that gave rise to it.  */
+
+  if (inev.ie.kind != NO_EVENT)
+    {
+      inev.ie.device = pgtk_get_device_for_event (dpyinfo, event);
+      evq_enqueue (&inev);
+
+      /* Next, save this event for future menu activations, unless it is
+	 only an update.  */
+      if (gdk_event_get_event_type (event) != GDK_TOUCH_UPDATE)
+	{
+	  if (dpyinfo->last_click_event != NULL)
+	    gdk_event_unref (dpyinfo->last_click_event);
+	  dpyinfo->last_click_event = gdk_event_ref (event);
+	}
+    }
+
+  return inev.ie.kind != NO_EVENT;
+}
+
+/* Handle the touchpad pinch EVENT on F.  */
+
+static gboolean
+pgtk_pinch (struct frame *f, GdkEvent *event)
+{
+  union buffered_input_event inev;
+  double dx, dy;
+  int x, y;
+
+  if (gdk_touchpad_event_get_gesture_phase (event)
+      == GDK_TOUCHPAD_GESTURE_PHASE_END)
+    return FALSE;
+
+  pgtk_event_frame_coords (f, event, &x, &y);
+  gdk_touchpad_event_get_deltas (event, &dx, &dy);
+
+  EVENT_INIT (inev.ie);
+  inev.ie.kind = PINCH_EVENT;
+  XSETFRAME (inev.ie.frame_or_window, f);
+  XSETINT (inev.ie.x, x);
+  XSETINT (inev.ie.y, y);
+  inev.ie.arg = list4 (make_float (dx), make_float (dy),
+		       make_float (gdk_touchpad_event_get_pinch_scale (event)),
+		       make_float (gdk_touchpad_event_get_pinch_angle_delta
+				   (event)));
+  inev.ie.modifiers
+    = pgtk_gtk_to_emacs_modifiers (FRAME_DISPLAY_INFO (f),
+				   gdk_event_get_modifier_state (event));
+  inev.ie.device = pgtk_get_device_for_event (FRAME_DISPLAY_INFO (f), event);
+  evq_enqueue (&inev);
+  return TRUE;
+}
+
+/* Called for every event targeting the edit widget of a frame.  */
+
+static gboolean
+pgtk_edit_widget_event (GtkEventControllerLegacy *controller,
+			GdkEvent *event, gpointer user_data)
+{
+  GtkWidget *widget
+    = gtk_event_controller_get_widget (GTK_EVENT_CONTROLLER (controller));
+  struct frame *f = pgtk_widget_to_frame (widget);
+
+  if (!f || !FRAME_LIVE_P (f) || !FRAME_X_OUTPUT (f))
+    return GDK_EVENT_PROPAGATE;
+
+  switch (gdk_event_get_event_type (event))
+    {
+    case GDK_KEY_PRESS:
+      return pgtk_key_press (f, event);
+
+    case GDK_KEY_RELEASE:
+      /* This is needed on Wayland because of some brain dead
+	 compositors.  Without them, we would not have to keep track of
+	 the serial of key release events.  */
+      FRAME_DISPLAY_INFO (f)->last_user_time = gdk_event_get_time (event);
+      return GDK_EVENT_STOP;
+
+    case GDK_MOTION_NOTIFY:
+      pgtk_motion (f, event);
+      return GDK_EVENT_STOP;
+
+    case GDK_BUTTON_PRESS:
+    case GDK_BUTTON_RELEASE:
+      pgtk_button (f, event);
+      return GDK_EVENT_STOP;
+
+    case GDK_SCROLL:
+      pgtk_scroll (f, event);
+      return GDK_EVENT_STOP;
+
+    case GDK_TOUCH_BEGIN:
+    case GDK_TOUCH_UPDATE:
+    case GDK_TOUCH_END:
+    case GDK_TOUCH_CANCEL:
+      return pgtk_touch (f, event);
+
+    case GDK_TOUCHPAD_PINCH:
+      return pgtk_pinch (f, event);
+
+    default:
+      return GDK_EVENT_PROPAGATE;
+    }
+}
+
+/* Called when the keyboard focus enters or leaves the edit widget of a
+   frame, including when its window is activated or deactivated.  */
+
+static void
+pgtk_focus_notify (GtkEventControllerFocus *controller, GParamSpec *pspec,
+		   gpointer user_data)
+{
+  GtkWidget *widget
+    = gtk_event_controller_get_widget (GTK_EVENT_CONTROLLER (controller));
+  struct frame *f = pgtk_widget_to_frame (widget);
+  union buffered_input_event inev;
+  bool focus = gtk_event_controller_focus_is_focus (controller);
+
+  if (!f || !FRAME_LIVE_P (f) || !FRAME_X_OUTPUT (f))
+    return;
+
+  EVENT_INIT (inev.ie);
+  inev.ie.kind = NO_EVENT;
+  inev.ie.arg = Qnil;
+
+  pgtk_focus_changed (focus, FOCUS_EXPLICIT, FRAME_DISPLAY_INFO (f), f,
+		      &inev);
+  if (inev.ie.kind != NO_EVENT)
+    evq_enqueue (&inev);
+
+  if (focus)
+    pgtk_im_focus_in (f);
+  else
+    pgtk_im_focus_out (f);
+}
+
+/* Called when the pointer enters or leaves the edit widget of a frame
+   itself, as opposed to any of its children.  */
+
+static void
+pgtk_pointer_notify (GtkEventControllerMotion *controller, GParamSpec *pspec,
+		     gpointer user_data)
+{
+  GtkWidget *widget
+    = gtk_event_controller_get_widget (GTK_EVENT_CONTROLLER (controller));
+  struct frame *frame = pgtk_widget_to_frame (widget);
+  Mouse_HLInfo *hlinfo;
+  Lisp_Object frame_obj;
+
+  if (!frame || !FRAME_LIVE_P (frame) || !FRAME_X_OUTPUT (frame)
+      || gtk_event_controller_motion_is_pointer (controller))
+    return;
+
+  hlinfo = MOUSE_HL_INFO (frame);
+
+  if (frame == hlinfo->mouse_face_mouse_frame)
+    {
+      /* If we move outside the frame, then we're
+	 certainly no longer on any text in the frame.  */
+      clear_mouse_face (hlinfo);
+      hlinfo->mouse_face_mouse_frame = 0;
+    }
+
+  if (any_help_event_p)
+    {
+      XSETFRAME (frame_obj, frame);
+      help_echo_string = Qnil;
+      gen_help_event (Qnil, frame_obj, Qnil, Qnil, 0);
+    }
+}
+
+/* Called when the edit widget of a frame is mapped.  */
+
+static void
+pgtk_edit_widget_map (GtkWidget *widget, gpointer user_data)
+{
+  struct frame *f = pgtk_widget_to_frame (widget);
+  union buffered_input_event inev;
+  bool iconified;
+
+  if (!f || !FRAME_LIVE_P (f) || !FRAME_X_OUTPUT (f))
+    return;
+
+  EVENT_INIT (inev.ie);
+  inev.ie.kind = NO_EVENT;
+  inev.ie.arg = Qnil;
+
+  iconified = FRAME_ICONIFIED_P (f);
+
+  /* Check if fullscreen was specified before we where mapped the
+     first time, i.e. from the command line.  */
+  if (!FRAME_X_OUTPUT (f)->has_been_visible)
+    set_fullscreen_state (f);
+
+  SET_FRAME_VISIBLE (f, 1);
+  SET_FRAME_ICONIFIED (f, false);
+  FRAME_X_OUTPUT (f)->has_been_visible = true;
+  pgtk_update_frame_scale (f);
+
+  if (iconified)
+    {
+      inev.ie.kind = DEICONIFY_EVENT;
+      XSETFRAME (inev.ie.frame_or_window, f);
+      evq_enqueue (&inev);
+    }
+}
+
+/* Called when the state of the toplevel surface of frame F (passed in
+   USER_DATA) changes.  */
+
+static void
+pgtk_toplevel_state_changed (GdkToplevel *toplevel, GParamSpec *pspec,
+			     gpointer user_data)
+{
+  struct frame *f = pgtk_widget_to_frame (user_data);
+  GdkToplevelState new_state;
+  union buffered_input_event inev;
+
+  if (!f || !FRAME_LIVE_P (f) || !FRAME_X_OUTPUT (f))
+    return;
+
+  new_state = gdk_toplevel_get_state (toplevel);
+
+  EVENT_INIT (inev.ie);
+  inev.ie.kind = NO_EVENT;
+  inev.ie.arg = Qnil;
+
+  if (new_state & GDK_TOPLEVEL_STATE_FULLSCREEN)
+    store_frame_param (f, Qfullscreen, Qfullboth);
+  else if (new_state & GDK_TOPLEVEL_STATE_MAXIMIZED)
+    store_frame_param (f, Qfullscreen, Qmaximized);
+  else if ((new_state & GDK_TOPLEVEL_STATE_TOP_TILED)
+	   && (new_state & GDK_TOPLEVEL_STATE_BOTTOM_TILED)
+	   && !(new_state & GDK_TOPLEVEL_STATE_TOP_RESIZABLE)
+	   && !(new_state & GDK_TOPLEVEL_STATE_BOTTOM_RESIZABLE))
+    store_frame_param (f, Qfullscreen, Qfullheight);
+  else if ((new_state & GDK_TOPLEVEL_STATE_LEFT_TILED)
+	   && (new_state & GDK_TOPLEVEL_STATE_RIGHT_TILED)
+	   && !(new_state & GDK_TOPLEVEL_STATE_LEFT_RESIZABLE)
+	   && !(new_state & GDK_TOPLEVEL_STATE_RIGHT_RESIZABLE))
+    store_frame_param (f, Qfullscreen, Qfullwidth);
+  else
+    store_frame_param (f, Qfullscreen, Qnil);
+
+  /* See the comment in window_state_event about why the iconified
+     state of a frame cannot be relied upon under Wayland.  */
+
+  if (new_state & GDK_TOPLEVEL_STATE_MINIMIZED)
+    {
+      SET_FRAME_ICONIFIED (f, true);
+      SET_FRAME_VISIBLE (f, false);
+    }
+  else if (gdk_surface_get_mapped (GDK_SURFACE (toplevel)))
+    {
+      if (FRAME_ICONIFIED_P (f))
+	{
+	  inev.ie.kind = DEICONIFY_EVENT;
+	  XSETFRAME (inev.ie.frame_or_window, f);
+	}
+
+      FRAME_X_OUTPUT (f)->has_been_visible = true;
+      SET_FRAME_ICONIFIED (f, false);
+      SET_FRAME_VISIBLE (f, true);
+    }
+
+  if (new_state & GDK_TOPLEVEL_STATE_STICKY)
+    store_frame_param (f, Qsticky, Qt);
+  else
+    store_frame_param (f, Qsticky, Qnil);
+
+  if (inev.ie.kind != NO_EVENT)
+    evq_enqueue (&inev);
+}
+
+/* Called when the scale of the surface of a toplevel window
+   changes.  */
+
+static void
+pgtk_surface_scale_changed (GdkSurface *surface, GParamSpec *pspec,
+			    gpointer user_data)
+{
+  Lisp_Object tail, frame;
+
+  /* Update the frame displayed in the window as well as its child
+     frames.  */
+  FOR_EACH_FRAME (tail, frame)
+    {
+      struct frame *f = XFRAME (frame);
+
+      if (FRAME_PGTK_P (f) && FRAME_LIVE_P (f)
+	  && FRAME_GDK_SURFACE (f) == surface)
+	{
+	  pgtk_update_frame_scale (f);
+	  gtk_widget_queue_draw (FRAME_GTK_WIDGET (f));
+	}
+    }
+}
+
+/* Called when the toplevel window WIDGET of a frame is realized.  */
+
+static void
+pgtk_toplevel_realized (GtkWidget *widget, gpointer user_data)
+{
+  GdkSurface *surface = gtk_native_get_surface (GTK_NATIVE (widget));
+
+  if (!surface || g_object_get_data (G_OBJECT (surface), "emacs-watched"))
+    return;
+
+  g_object_set_data (G_OBJECT (surface), "emacs-watched",
+		     GINT_TO_POINTER (1));
+  g_signal_connect (surface, "notify::state",
+		    G_CALLBACK (pgtk_toplevel_state_changed), widget);
+  g_signal_connect (surface, "notify::mapped",
+		    G_CALLBACK (pgtk_toplevel_state_changed), widget);
+  g_signal_connect (surface, "notify::scale",
+		    G_CALLBACK (pgtk_surface_scale_changed), NULL);
+}
+
+/* Called when the user asks for the toplevel window WINDOW to be
+   closed.  */
+
+static gboolean
+pgtk_close_request (GtkWindow *window, gpointer user_data)
+{
+  struct frame *f = pgtk_widget_to_frame (GTK_WIDGET (window));
+  union buffered_input_event inev;
+
+  if (f && FRAME_LIVE_P (f))
+    {
+      EVENT_INIT (inev.ie);
+      inev.ie.kind = DELETE_WINDOW_EVENT;
+      inev.ie.arg = Qnil;
+      XSETFRAME (inev.ie.frame_or_window, f);
+      evq_enqueue (&inev);
+    }
+
+  /* Emacs deletes the frame itself.  */
+  return TRUE;
+}
+
+
+/* C part of drop handling code.  The Lisp part is in pgtk-dnd.el.
+
+   Lisp is told about drops through DRAG_N_DROP_EVENTs.  Their
+   arguments name the selection holding the dropped data,
+   XdndSelection, which pgtk-get-selection-internal reads from the
+   current drop.  */
+
+/* A counter used to give drops a timestamp.  */
+static guint32 drop_counter;
+
+/* The actions frames accept drops with.  */
+#define PGTK_DROP_ACTIONS (GDK_ACTION_COPY | GDK_ACTION_MOVE | GDK_ACTION_LINK)
+
+/* Return the action the source of DROP suggests, which is the one
+   it offers if there is only one, and the most harmless one
+   otherwise.  */
+
+static GdkDragAction
+pgtk_drop_suggested_action (GdkDrop *drop)
+{
+  GdkDragAction actions = gdk_drop_get_actions (drop);
+
+  if (gdk_drag_action_is_unique (actions))
+    return actions;
+  if (actions & GDK_ACTION_COPY)
+    return GDK_ACTION_COPY;
+  if (actions & GDK_ACTION_MOVE)
+    return GDK_ACTION_MOVE;
+  return actions & GDK_ACTION_LINK;
+}
+
+static void
+pgtk_drop_event (struct frame *f, GdkDrop *drop, double wx, double wy,
+		 Lisp_Object kind)
+{
+  union buffered_input_event inev;
+  int x = 0, y = 0;
+
+  EVENT_INIT (inev.ie);
+  inev.ie.kind = DRAG_N_DROP_EVENT;
+  inev.ie.modifiers = 0;
+  inev.ie.timestamp = current_drop_time;
+
+  if (NILP (kind))
+    inev.ie.arg = Qnil;
+  else
+    {
+      pgtk_widget_to_frame_coords (f, wx, wy, &x, &y);
+      inev.ie.arg = list4 (kind, intern ("XdndSelection"),
+			   make_uint (current_drop_time),
+			   drag_action_to_symbol
+			   (pgtk_drop_suggested_action (drop)));
+    }
+
+  XSETINT (inev.ie.x, x);
+  XSETINT (inev.ie.y, y);
+  XSETFRAME (inev.ie.frame_or_window, f);
+  evq_enqueue (&inev);
+}
+
+/* Make DROP the current drop.  */
+
+static void
+pgtk_set_current_drop (GdkDrop *drop)
+{
+  if (drop != current_drop)
+    {
+      if (current_drop)
+	g_object_unref (current_drop);
+      current_drop = drop ? g_object_ref (drop) : NULL;
+      current_drop_action = 0;
+      current_drop_x = current_drop_y = NAN;
+      current_drop_source_actions = 0;
+      pgtk_drop_set_current (drop);
+    }
+}
+
+static GdkDragAction
+pgtk_drag_motion (GtkDropTargetAsync *target, GdkDrop *drop, double x,
+		  double y, gpointer user_data)
+{
+  GtkWidget *widget
+    = gtk_event_controller_get_widget (GTK_EVENT_CONTROLLER (target));
+  struct frame *f = pgtk_widget_to_frame (widget);
+  GdkDragAction actions;
+
+  if (!f || !FRAME_LIVE_P (f))
+    return 0;
+
+  pgtk_set_current_drop (drop);
+
+  /* GDK also reports a motion whenever the compositor renegotiates
+     the action, which it does in response to the status Lisp asks
+     for.  Only tell Lisp about real changes, lest the two keep
+     answering each other.  */
+  actions = gdk_drop_get_actions (drop);
+  if (x != current_drop_x || y != current_drop_y
+      || actions != current_drop_source_actions)
+    {
+      current_drop_x = x;
+      current_drop_y = y;
+      current_drop_source_actions = actions;
+      current_drop_time = ++drop_counter;
+      pgtk_drop_event (f, drop, x, y, Qlambda);
+    }
+
+  /* Lisp decides on the action asynchronously, and calls
+     pgtk-update-drop-status; return what it said last.  GTK
+     rejects the drop for now if that is nothing.  */
+  return current_drop_action;
+}
+
+static void
+pgtk_drag_leave (GtkDropTargetAsync *target, GdkDrop *drop,
+		 gpointer user_data)
+{
+  GtkWidget *widget
+    = gtk_event_controller_get_widget (GTK_EVENT_CONTROLLER (target));
+  struct frame *f = pgtk_widget_to_frame (widget);
+
+  if (!f || !FRAME_LIVE_P (f))
+    return;
+
+  pgtk_drop_event (f, drop, 0, 0, Qnil);
+}
+
+static gboolean
+pgtk_drag_drop (GtkDropTargetAsync *target, GdkDrop *drop, double x,
+		double y, gpointer user_data)
+{
+  GtkWidget *widget
+    = gtk_event_controller_get_widget (GTK_EVENT_CONTROLLER (target));
+  struct frame *f = pgtk_widget_to_frame (widget);
+
+  if (!f || !FRAME_LIVE_P (f))
+    return FALSE;
+
+  pgtk_set_current_drop (drop);
+  current_drop_time = ++drop_counter;
+  if (!current_drop_action)
+    current_drop_action = pgtk_drop_suggested_action (drop);
+  pgtk_drop_event (f, drop, x, y, Qquote);
+
+  /* Lisp finishes the drop by calling pgtk-drop-finish.  */
+  return TRUE;
+}
+
+void
+pgtk_update_drop_status (Lisp_Object action, Lisp_Object event_time)
+{
+  guint32 time;
+
+  CONS_TO_INTEGER (event_time, guint32, time);
+
+  if (!current_drop || time < current_drop_time)
+    return;
+
+  current_drop_action = symbol_to_drag_action (action);
+
+  /* Wayland cancels drops whose action the source does not offer, so
+     fall back to one it does when Lisp accepts the drop.  */
+  if (current_drop_action
+      && !(current_drop_action & gdk_drop_get_actions (current_drop)))
+    current_drop_action = pgtk_drop_suggested_action (current_drop);
+
+  /* Use the same actions as GTK does when it repeats this status on
+     the next motion.  */
+  gdk_drop_status (current_drop,
+		   current_drop_action ? PGTK_DROP_ACTIONS : 0,
+		   current_drop_action);
+}
+
+void
+pgtk_finish_drop (Lisp_Object success, Lisp_Object event_time,
+		  Lisp_Object del)
+{
+  guint32 time;
+  GdkDragAction action;
+
+  CONS_TO_INTEGER (event_time, guint32, time);
+
+  if (!current_drop || time < current_drop_time)
+    return;
+
+  if (NILP (success))
+    action = 0;
+  else if (!NILP (del)
+	   && (gdk_drop_get_actions (current_drop) & GDK_ACTION_MOVE))
+    action = GDK_ACTION_MOVE;
+  else if (current_drop_action)
+    action = current_drop_action;
+  else
+    action = pgtk_drop_suggested_action (current_drop);
+
+  gdk_drop_finish (current_drop, action);
+  pgtk_set_current_drop (NULL);
+}
+
+
+/* Callbacks for sundries.  */
+
+static void
+pgtk_monitors_changed_cb (GListModel *monitors, guint position,
+			  guint removed, guint added, gpointer user_data)
+{
+  struct terminal *terminal;
+  union buffered_input_event inev;
+
+  EVENT_INIT (inev.ie);
+  terminal = user_data;
+  inev.ie.kind = MONITORS_CHANGED_EVENT;
+  XSETTERMINAL (inev.ie.arg, terminal);
+
+  evq_enqueue (&inev);
+}
+
+/* Set up the event handlers of frame F.  */
+
+void
+pgtk_set_event_handler (struct frame *f)
+{
+  GtkWidget *fixed = FRAME_GTK_WIDGET (f);
+  GtkEventController *controller;
+
+  if (f->tooltip)
+    return;
+
+  /* Child frames that become toplevel frames keep their edit
+     widgets, which must not get a second set of controllers.  */
+  if (!g_object_get_data (G_OBJECT (fixed), "emacs-event-handlers"))
+    {
+      g_object_set_data (G_OBJECT (fixed), "emacs-event-handlers",
+			 GINT_TO_POINTER (1));
+
+      controller = gtk_event_controller_legacy_new ();
+      gtk_event_controller_set_propagation_phase (controller,
+						  GTK_PHASE_TARGET);
+      g_signal_connect (controller, "event",
+			G_CALLBACK (pgtk_edit_widget_event), NULL);
+      gtk_widget_add_controller (fixed, controller);
+
+      controller = gtk_event_controller_focus_new ();
+      g_signal_connect (controller, "notify::is-focus",
+			G_CALLBACK (pgtk_focus_notify), NULL);
+      gtk_widget_add_controller (fixed, controller);
+
+      controller = gtk_event_controller_motion_new ();
+      g_signal_connect (controller, "notify::is-pointer",
+			G_CALLBACK (pgtk_pointer_notify), NULL);
+      gtk_widget_add_controller (fixed, controller);
+
+      controller = GTK_EVENT_CONTROLLER (gtk_drop_target_async_new
+					 (NULL, PGTK_DROP_ACTIONS));
+      g_signal_connect (controller, "drag-enter",
+			G_CALLBACK (pgtk_drag_motion), NULL);
+      g_signal_connect (controller, "drag-motion",
+			G_CALLBACK (pgtk_drag_motion), NULL);
+      g_signal_connect (controller, "drag-leave",
+			G_CALLBACK (pgtk_drag_leave), NULL);
+      g_signal_connect (controller, "drop",
+			G_CALLBACK (pgtk_drag_drop), NULL);
+      gtk_widget_add_controller (fixed, controller);
+
+      g_signal_connect (fixed, "map", G_CALLBACK (pgtk_edit_widget_map),
+			NULL);
+    }
+
+  if (FRAME_GTK_OUTER_WIDGET (f))
+    {
+      GtkWidget *window = FRAME_GTK_OUTER_WIDGET (f);
+
+      g_signal_connect (window, "close-request",
+			G_CALLBACK (pgtk_close_request), NULL);
+      g_signal_connect (window, "realize",
+			G_CALLBACK (pgtk_toplevel_realized), NULL);
+      if (gtk_widget_get_realized (window))
+	pgtk_toplevel_realized (window, NULL);
+    }
+}
+
+#endif /* HAVE_GTK4 */
+
 static void
 my_log_handler (const gchar * log_domain, GLogLevelFlags log_level,
 		const gchar * msg, gpointer user_data)
@@ -6961,6 +9124,7 @@ same_x_server (const char *name1, const char *name2)
 	  && (*name2 == '.' || *name2 == '\0'));
 }
 
+#ifndef HAVE_GTK4
 static struct frame *
 pgtk_find_selection_owner (GdkWindow *window)
 {
@@ -7066,6 +9230,8 @@ pgtk_display_x_warning (GdkDisplay *display)
   gtk_widget_show (dialog_widget);
 }
 
+#endif /* !HAVE_GTK4 */
+
 /* Open a connection to X display DISPLAY_NAME, and return
    the structure that describes the open display.
    If we cannot contact the display, return null.  */
@@ -7082,7 +9248,9 @@ pgtk_term_init (Lisp_Object display_name, char *resource_name)
   char *dpy_name;
   static void *handle = NULL;
   Lisp_Object lisp_dpy_name = Qnil;
+#ifndef HAVE_GTK4
   GdkScreen *gscr;
+#endif
   gdouble dpi;
 
   block_input ();
@@ -7107,16 +9275,52 @@ pgtk_term_init (Lisp_Object display_name, char *resource_name)
   lisp_dpy_name = build_string (dpy_name);
 
   {
+#ifndef HAVE_GTK4
 #define NUM_ARGV 10
     int argc;
     char *argv[NUM_ARGV];
     char **argv2 = argv;
+#endif
     guint id;
 
     if (was_initialized)
       {
 	xg_display_open (dpy_name, &dpy);
       }
+#ifdef HAVE_GTK4
+    else
+      {
+	/* Work around GLib bug that outputs a faulty warning. See
+	   https://bugzilla.gnome.org/show_bug.cgi?id=563627.  */
+	id = g_log_set_handler ("GLib", G_LOG_LEVEL_WARNING | G_LOG_FLAG_FATAL
+				| G_LOG_FLAG_RECURSION, my_log_handler, NULL);
+
+	/* The program name is used as the application ID of windows,
+	   and should match the name of Emacs's desktop file.  */
+	g_set_prgname (resource_name);
+
+	gtk_disable_setlocale ();
+	unrequest_sigio ();	/* See comment in x_display_ok.  */
+	gtk_init ();
+	request_sigio ();
+
+        g_log_remove_handler ("GLib", id);
+
+	if (strlen (dpy_name) != 0)
+	  xg_display_open (dpy_name, &dpy);
+	else
+	  dpy = DEFAULT_GDK_DISPLAY ();
+
+        xg_initialize ();
+
+	if (dpy)
+	  {
+	    initial_display = xstrdup (gdk_display_get_name (dpy));
+	    dpy_name = initial_display;
+	    lisp_dpy_name = build_string (dpy_name);
+	  }
+      }
+#else
     else
       {
         static char display_opt[] = "--display";
@@ -7157,6 +9361,7 @@ pgtk_term_init (Lisp_Object display_name, char *resource_name)
 	dpy_name = initial_display;
 	lisp_dpy_name = build_string (dpy_name);
       }
+#endif
   }
 
   /* Detect failure.  */
@@ -7168,7 +9373,15 @@ pgtk_term_init (Lisp_Object display_name, char *resource_name)
 
   /* If the PGTK port is being used under X, complain very loudly, as
      that isn't supported.  */
+#ifndef HAVE_GTK4
   pgtk_display_x_warning (dpy);
+#else
+  if (!strcmp (G_OBJECT_TYPE_NAME (dpy), "GdkX11Display"))
+    fputs ("Warning: You are trying to run Emacs configured with the\n"
+	   "\"pure-GTK\" interface under the X Window System.  That\n"
+	   "configuration is unsupported and will lead to various problems.\n",
+	   stderr);
+#endif
 
   dpyinfo = xzalloc (sizeof *dpyinfo);
   pgtk_initialize_display_info (dpyinfo);
@@ -7223,28 +9436,57 @@ pgtk_term_init (Lisp_Object display_name, char *resource_name)
   /* We must create a GTK cursor, it is required for GTK widgets.  */
   dpyinfo->xg_cursor = xg_create_default_cursor (dpyinfo->gdpy);
 
+#ifndef HAVE_GTK4
   dpyinfo->vertical_scroll_bar_cursor
     = gdk_cursor_new_for_display (dpyinfo->gdpy, GDK_SB_V_DOUBLE_ARROW);
 
   dpyinfo->horizontal_scroll_bar_cursor
     = gdk_cursor_new_for_display (dpyinfo->gdpy, GDK_SB_H_DOUBLE_ARROW);
+#else
+  dpyinfo->vertical_scroll_bar_cursor
+    = gdk_cursor_new_from_name ("ns-resize", NULL);
+
+  dpyinfo->horizontal_scroll_bar_cursor
+    = gdk_cursor_new_from_name ("ew-resize", NULL);
+#endif
 
   dpyinfo->icon_bitmap_id = -1;
 
   reset_mouse_highlight (&dpyinfo->mouse_highlight);
 
+#ifndef HAVE_GTK4
   gscr = gdk_display_get_default_screen (dpyinfo->gdpy);
   dpi = gdk_screen_get_resolution (gscr);
 
   if (dpi < 0)
     dpi = 96.0;
+#else
+  {
+    int xft_dpi = -1;
+
+    /* gtk-xft-dpi is the resolution of text in logical pixels, which
+       reflects the user's text scaling factor.  Emacs pixels are
+       device pixels, so multiply it by the scale of the display.  */
+    g_object_get (gtk_settings_get_for_display (dpyinfo->gdpy),
+		  "gtk-xft-dpi", &xft_dpi, NULL);
+    dpi = xft_dpi > 0 ? xft_dpi / 1024.0 : 96.0;
+    dpyinfo->text_resolution = dpi;
+    dpi *= pgtk_display_scale (dpyinfo);
+  }
+#endif
 
   dpyinfo->resx = dpi;
   dpyinfo->resy = dpi;
 
+#ifndef HAVE_GTK4
   g_signal_connect (G_OBJECT (gscr), "monitors-changed",
 		    G_CALLBACK (pgtk_monitors_changed_cb),
 		    terminal);
+#else
+  g_signal_connect (gdk_display_get_monitors (dpyinfo->gdpy),
+		    "items-changed", G_CALLBACK (pgtk_monitors_changed_cb),
+		    terminal);
+#endif
 
   /* Set up scrolling increments.  */
   dpyinfo->scroll.x_per_char = 1;
@@ -7293,12 +9535,19 @@ pgtk_term_init (Lisp_Object display_name, char *resource_name)
 	init_sigio (dpyinfo->connection);
     }
 
+#ifndef HAVE_GTK4
   dpyinfo->invisible_cursor
     = gdk_cursor_new_for_display (dpyinfo->gdpy, GDK_BLANK_CURSOR);
+#else
+  dpyinfo->invisible_cursor = gdk_cursor_new_from_name ("none", NULL);
+#endif
 
   xsettings_initialize (dpyinfo);
 
   pgtk_im_init (dpyinfo);
+#ifdef HAVE_GTK4
+  pgtk_selection_init (dpyinfo);
+#endif
 
   g_signal_connect (G_OBJECT (dpyinfo->gdpy), "seat-added",
 		    G_CALLBACK (pgtk_seat_added_cb), dpyinfo);
@@ -7560,6 +9809,12 @@ If set to a non-float value, there will be no wait at all.  */);
   window_being_scrolled = Qnil;
   staticpro (&window_being_scrolled);
 
+#ifdef HAVE_GTK4
+  DEFSYM (Qpgtk__frame_resolution_changed,
+	  "pgtk--frame-resolution-changed");
+  defsubr (&Spgtk_frame_resolution);
+#endif
+
   /* Tell Emacs about this window system.  */
   Fprovide (Qpgtk, Qnil);
 }
@@ -7593,6 +9848,7 @@ pgtk_begin_cr_clip (struct frame *f)
 
   if (!cr)
     {
+#ifndef HAVE_GTK4
       cairo_surface_t *surface
 	= gdk_window_create_similar_surface (gtk_widget_get_window
 					     (FRAME_GTK_WIDGET (f)),
@@ -7600,10 +9856,26 @@ pgtk_begin_cr_clip (struct frame *f)
 					     FRAME_CR_SURFACE_DESIRED_WIDTH (f),
 					     FRAME_CR_SURFACE_DESIRED_HEIGHT
 					     (f));
+#else
+      /* Emacs draws in device pixels, so the surface is not scaled.
+	 Its contents are copied to a texture when the frame is
+	 displayed.  */
+      cairo_surface_t *surface
+	= cairo_image_surface_create (CAIRO_FORMAT_ARGB32,
+				      max (1, FRAME_CR_SURFACE_DESIRED_WIDTH (f)),
+				      max (1, FRAME_CR_SURFACE_DESIRED_HEIGHT
+					   (f)));
+#endif
 
       cr = FRAME_CR_CONTEXT (f) = cairo_create (surface);
       cairo_surface_destroy (surface);
     }
+
+#ifdef HAVE_GTK4
+  /* The texture holding the contents of the frame is now stale.  */
+  if (cr == FRAME_CR_ACTIVE_CONTEXT (f))
+    g_clear_object (&FRAME_X_OUTPUT (f)->texture);
+#endif
 
   cairo_save (cr);
 

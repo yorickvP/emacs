@@ -34,6 +34,30 @@ G_BEGIN_DECLS
 
 struct frame;
 
+#ifdef HAVE_GTK4
+
+/* Under GTK 4, the edit widget of a frame is a plain widget that
+   draws the frame's contents and positions its children (scroll bars,
+   child frames and xwidgets) at fixed logical coordinates.  */
+
+typedef struct _EmacsFixed EmacsFixed;
+typedef struct _EmacsFixedClass EmacsFixedClass;
+
+#define EMACS_FIXED(obj) \
+  G_TYPE_CHECK_INSTANCE_CAST (obj, EMACS_TYPE_FIXED, EmacsFixed)
+
+extern GType emacs_fixed_get_type (void);
+extern GtkWidget *emacs_fixed_new (struct frame *f);
+extern struct frame *emacs_fixed_get_frame (GtkWidget *fixed);
+extern void emacs_fixed_set_frame (GtkWidget *fixed, struct frame *f);
+extern void emacs_fixed_put (GtkWidget *fixed, GtkWidget *child,
+			     double x, double y);
+extern void emacs_fixed_move (GtkWidget *fixed, GtkWidget *child,
+			      double x, double y);
+extern void emacs_fixed_remove (GtkWidget *fixed, GtkWidget *child);
+
+#else /* !HAVE_GTK4 */
+
 typedef struct _EmacsFixedPrivate       EmacsFixedPrivate;
 
 struct _EmacsFixed
@@ -54,6 +78,8 @@ extern GType emacs_fixed_get_type (void);
 #endif
 
 extern GtkWidget *emacs_fixed_new (struct frame *f);
+
+#endif /* !HAVE_GTK4 */
 
 G_END_DECLS
 

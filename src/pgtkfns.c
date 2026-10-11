@@ -26,6 +26,9 @@ along with GNU Emacs.  If not, see <https://www.gnu.org/licenses/>.  */
 #include "lisp.h"
 #include "blockinput.h"
 #include "gtkutil.h"
+#ifdef HAVE_GTK4
+#include "emacsgtkfixed.h"
+#endif
 #include "window.h"
 #include "character.h"
 #include "buffer.h"
@@ -41,6 +44,48 @@ static int x_decode_color (struct frame *f, Lisp_Object color_name,
 static struct pgtk_display_info *pgtk_display_info_for_name (Lisp_Object);
 
 static const char *pgtk_app_name = "Emacs";
+
+#ifdef HAVE_GTK4
+/* GDK 4 keeps the monitors of a display in a list model.  These
+   replace the GDK 3 functions of the same name.  */
+
+static int
+pgtk_display_get_n_monitors (GdkDisplay *gdpy)
+{
+  return g_list_model_get_n_items (gdk_display_get_monitors (gdpy));
+}
+
+static GdkMonitor *
+pgtk_display_get_monitor (GdkDisplay *gdpy, int i)
+{
+  GdkMonitor *monitor
+    = g_list_model_get_item (gdk_display_get_monitors (gdpy), i);
+
+  /* The list model keeps a reference to the monitor.  */
+  g_object_unref (monitor);
+  return monitor;
+}
+
+#define gdk_display_get_n_monitors pgtk_display_get_n_monitors
+#define gdk_display_get_monitor pgtk_display_get_monitor
+
+/* GDK 4 monitors can have fractional scales.  */
+#define gdk_monitor_get_scale_factor gdk_monitor_get_scale
+
+/* Load the CSS rules in CSS into PROVIDER.  */
+
+static void
+pgtk_load_css (GtkCssProvider *provider, const char *css)
+{
+  gtk_css_provider_load_from_string (provider, css);
+}
+#else
+static void
+pgtk_load_css (GtkCssProvider *provider, const char *css)
+{
+  gtk_css_provider_load_from_data (provider, css, -1, NULL);
+}
+#endif
 
 /* Scale factor manually set per monitor.  */
 static Lisp_Object monitor_scale_factor_alist;
@@ -226,6 +271,7 @@ pgtk_set_alpha_background (struct frame *f, Lisp_Object arg, Lisp_Object oldval)
 {
   gui_set_alpha_background (f, arg, oldval);
 
+#ifndef HAVE_GTK4
   /* This prevents GTK from painting the window's background, which
      interferes with transparent background in some environments */
 
@@ -237,6 +283,31 @@ pgtk_set_alpha_background (struct frame *f, Lisp_Object arg, Lisp_Object oldval)
       && f->alpha_background != 1.0)
     gdk_window_set_opaque_region (gtk_widget_get_window (FRAME_GTK_OUTER_WIDGET (f)),
 				  NULL);
+#else
+  /* Don't let GTK paint the window's background, which would show
+     through the transparent background of the frame.  */
+  if (FRAME_GTK_OUTER_WIDGET (f))
+    {
+      GtkWidget *window = FRAME_GTK_OUTER_WIDGET (f);
+      GtkCssProvider *provider
+	= g_object_get_data (G_OBJECT (window), "emacs-alpha-provider");
+
+      if (!provider)
+	{
+	  provider = gtk_css_provider_new ();
+	  gtk_style_context_add_provider (gtk_widget_get_style_context (window),
+					  GTK_STYLE_PROVIDER (provider),
+					  GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
+	  g_object_set_data_full (G_OBJECT (window), "emacs-alpha-provider",
+				  provider, g_object_unref);
+	}
+
+      pgtk_load_css (provider, (f->alpha_background != 1.0
+				? "window { background: none; }" : ""));
+    }
+
+  xg_set_background_color (f, FRAME_BACKGROUND_PIXEL (f));
+#endif
 }
 
 static void
@@ -732,6 +803,10 @@ pgtk_set_override_redirect (struct frame *f, Lisp_Object new_value,
 bool
 xg_set_icon (struct frame *f, Lisp_Object file)
 {
+#ifdef HAVE_GTK4
+  /* GTK 4 windows can only have icons from the icon theme.  */
+  return false;
+#else
   bool result = false;
   Lisp_Object found;
 
@@ -764,11 +839,15 @@ xg_set_icon (struct frame *f, Lisp_Object file)
     }
 
   return result;
+#endif
 }
 
 bool
 xg_set_icon_from_xpm_data (struct frame *f, const char **data)
 {
+#ifdef HAVE_GTK4
+  return false;
+#else
   /* gdk-pixbuf 2.44 deprecated gdk_pixbuf_new_from_xpm_data.
      Emacs should convert assets to PNG and use gdk_pixbuf_new_from_stream
      with a GMemoryInputStream, or transition to PNG via GResource.
@@ -797,6 +876,7 @@ xg_set_icon_from_xpm_data (struct frame *f, const char **data)
   gtk_window_set_icon (GTK_WINDOW (FRAME_GTK_OUTER_WIDGET (f)), pixbuf);
   g_object_unref (pixbuf);
   return true;
+#endif
 }
 
 static void
@@ -806,10 +886,12 @@ pgtk_set_sticky (struct frame *f, Lisp_Object new_value,
   if (!FRAME_GTK_OUTER_WIDGET (f))
     return;
 
+#ifndef HAVE_GTK4
   if (!NILP (new_value))
     gtk_window_stick (GTK_WINDOW (FRAME_GTK_OUTER_WIDGET (f)));
   else
     gtk_window_unstick (GTK_WINDOW (FRAME_GTK_OUTER_WIDGET (f)));
+#endif
 }
 
 static void
@@ -842,7 +924,7 @@ pgtk_set_scroll_bar_foreground (struct frame *f, Lisp_Object new_value,
 
   if (NILP (new_value))
     {
-      gtk_css_provider_load_from_data (css_provider, "", -1, NULL);
+      pgtk_load_css (css_provider, "");
       update_face_from_frame_parameter (f, Qscroll_bar_foreground, new_value);
     }
   else if (STRINGP (new_value))
@@ -855,7 +937,7 @@ pgtk_set_scroll_bar_foreground (struct frame *f, Lisp_Object new_value,
       char css[64];
       sprintf (css, "scrollbar slider { background-color: #%06x; }",
 	       (unsigned int) rgb.pixel & 0xffffff);
-      gtk_css_provider_load_from_data (css_provider, css, -1, NULL);
+      pgtk_load_css (css_provider, css);
       update_face_from_frame_parameter (f, Qscroll_bar_foreground, new_value);
 
     }
@@ -870,9 +952,13 @@ pgtk_set_scroll_bar_background (struct frame *f, Lisp_Object new_value,
   GtkCssProvider *css_provider =
     FRAME_X_OUTPUT (f)->scrollbar_background_css_provider;
 
+  /* Tooltip frames have no scroll bars.  */
+  if (!css_provider)
+    return;
+
   if (NILP (new_value))
     {
-      gtk_css_provider_load_from_data (css_provider, "", -1, NULL);
+      pgtk_load_css (css_provider, "");
       update_face_from_frame_parameter (f, Qscroll_bar_background, new_value);
     }
   else if (STRINGP (new_value))
@@ -888,7 +974,7 @@ pgtk_set_scroll_bar_background (struct frame *f, Lisp_Object new_value,
       char css[64];
       sprintf (css, "scrollbar trough { background-color: #%06x; }",
 	       (unsigned int) rgb.pixel & 0xffffff);
-      gtk_css_provider_load_from_data (css_provider, css, -1, NULL);
+      pgtk_load_css (css_provider, css);
       update_face_from_frame_parameter (f, Qscroll_bar_background, new_value);
 
     }
@@ -1143,6 +1229,7 @@ pgtk_default_font_parameter (struct frame *f, Lisp_Object parms)
 			 RES_TYPE_STRING);
 }
 
+#ifndef HAVE_GTK4
 static void
 update_watched_scale_factor (struct atimer *timer)
 {
@@ -1158,6 +1245,7 @@ update_watched_scale_factor (struct atimer *timer)
 					   true);
     }
 }
+#endif
 
 /* ==========================================================================
 
@@ -1327,6 +1415,16 @@ DEFUN ("x-create-frame", Fx_create_frame, Sx_create_frame, 1, 1, 0,
     gtk_css_provider_new ();
   FRAME_X_OUTPUT (f)->scrollbar_background_css_provider =
     gtk_css_provider_new ();
+
+#ifdef HAVE_GTK4
+  /* Until the frame is displayed, assume it will be displayed at the
+     scale of the display; Emacs pixels are device pixels.  */
+  FRAME_X_OUTPUT (f)->scale = (!NILP (parent_frame)
+			       ? FRAME_GTK_SCALE (XFRAME (parent_frame))
+			       : pgtk_display_scale (dpyinfo));
+  FRAME_X_OUTPUT (f)->resolution
+    = dpyinfo->text_resolution * FRAME_X_OUTPUT (f)->scale;
+#endif
 
   fset_icon_name (f,
 		  gui_display_get_arg (dpyinfo, parms, Qicon_name, "iconName",
@@ -1559,6 +1657,7 @@ DEFUN ("x-create-frame", Fx_create_frame, Sx_create_frame, 1, 1, 0,
   xg_create_frame_widgets (f);
   pgtk_set_event_handler (f);
 
+#ifndef HAVE_GTK4
   if (FRAME_GTK_OUTER_WIDGET (f))
     gtk_widget_realize (FRAME_GTK_OUTER_WIDGET (f));
 
@@ -1587,6 +1686,29 @@ DEFUN ("x-create-frame", Fx_create_frame, Sx_create_frame, 1, 1, 0,
   INSTALL_CURSOR (bottom_left_corner_cursor, BOTTOM_LEFT_CORNER);
 
 #undef INSTALL_CURSOR
+#else
+  /* GDK 4 cursors are named after CSS cursors.  */
+#define INSTALL_CURSOR(FIELD, NAME) \
+  FRAME_X_OUTPUT (f)->FIELD = gdk_cursor_new_from_name (NAME, NULL)
+
+  INSTALL_CURSOR (text_cursor, "text");
+  INSTALL_CURSOR (nontext_cursor, "default");
+  INSTALL_CURSOR (modeline_cursor, "text");
+  INSTALL_CURSOR (hand_cursor, "pointer");
+  INSTALL_CURSOR (hourglass_cursor, "wait");
+  INSTALL_CURSOR (horizontal_drag_cursor, "ew-resize");
+  INSTALL_CURSOR (vertical_drag_cursor, "ns-resize");
+  INSTALL_CURSOR (left_edge_cursor, "w-resize");
+  INSTALL_CURSOR (right_edge_cursor, "e-resize");
+  INSTALL_CURSOR (top_edge_cursor, "n-resize");
+  INSTALL_CURSOR (bottom_edge_cursor, "s-resize");
+  INSTALL_CURSOR (top_left_corner_cursor, "nw-resize");
+  INSTALL_CURSOR (top_right_corner_cursor, "ne-resize");
+  INSTALL_CURSOR (bottom_right_corner_cursor, "se-resize");
+  INSTALL_CURSOR (bottom_left_corner_cursor, "sw-resize");
+
+#undef INSTALL_CURSOR
+#endif
 
   /* Now consider the frame official.  */
   f->terminal->reference_count++;
@@ -1627,12 +1749,24 @@ DEFUN ("x-create-frame", Fx_create_frame, Sx_create_frame, 1, 1, 0,
       GtkWidget *fixed_of_p = FRAME_GTK_WIDGET (p);
       GtkWidget *whbox_of_f = gtk_widget_get_parent (fixed);
       g_object_ref (fixed);
+#ifndef HAVE_GTK4
       gtk_container_remove (GTK_CONTAINER (whbox_of_f), fixed);
       gtk_fixed_put (GTK_FIXED (fixed_of_p), fixed, f->left_pos, f->top_pos);
       gtk_widget_show_all (fixed);
       g_object_unref (fixed);
 
       gtk_widget_destroy (FRAME_GTK_OUTER_WIDGET (f));
+#else
+      gtk_box_remove (GTK_BOX (whbox_of_f), fixed);
+      emacs_fixed_put (fixed_of_p, fixed,
+		       PGTK_TO_LOGICAL (p, f->left_pos),
+		       PGTK_TO_LOGICAL (p, f->top_pos));
+      g_object_unref (fixed);
+
+      free_frame_tool_bar (f);
+      g_clear_object (&FRAME_OUTPUT_DATA (f)->toolbar_widget);
+      gtk_window_destroy (GTK_WINDOW (FRAME_GTK_OUTER_WIDGET (f)));
+#endif
       FRAME_GTK_OUTER_WIDGET (f) = NULL;
       FRAME_OUTPUT_DATA (f)->vbox_widget = NULL;
       FRAME_OUTPUT_DATA (f)->hbox_widget = NULL;
@@ -1645,12 +1779,14 @@ DEFUN ("x-create-frame", Fx_create_frame, Sx_create_frame, 1, 1, 0,
       unblock_input ();
     }
 
+#ifndef HAVE_GTK4
   if (FRAME_GTK_OUTER_WIDGET (f))
     {
       GList *w = gtk_container_get_children (GTK_CONTAINER (FRAME_GTK_OUTER_WIDGET (f)));
       for (; w != NULL; w = w->next)
 	gtk_widget_show_all (GTK_WIDGET (w->data));
     }
+#endif
 
   gui_default_parameter (f, parms, Qno_focus_on_map, Qnil,
 			 NULL, NULL, RES_TYPE_BOOLEAN);
@@ -1750,12 +1886,14 @@ DEFUN ("x-create-frame", Fx_create_frame, Sx_create_frame, 1, 1, 0,
 
   FRAME_X_OUTPUT (f)->cr_surface_visible_bell = NULL;
   FRAME_X_OUTPUT (f)->atimer_visible_bell = NULL;
+#ifndef HAVE_GTK4
   FRAME_X_OUTPUT (f)->watched_scale_factor = 1.0;
   struct timespec ts = make_timespec (1, 0);
   FRAME_X_OUTPUT (f)->scale_factor_atimer = start_atimer(ATIMER_CONTINUOUS,
 							 ts,
 							 update_watched_scale_factor,
 							 f);
+#endif
 
   /* Make sure windows on this frame appear in calls to next-window
      and similar functions.  */
@@ -2457,12 +2595,30 @@ Internal use only, use `display-monitor-attributes-list' instead.  */)
 	  && FRAME_DISPLAY_INFO (f) == dpyinfo
 	  && !FRAME_TOOLTIP_P (f))
 	{
+#ifndef HAVE_GTK4
 	  GdkWindow *gwin = gtk_widget_get_window (FRAME_GTK_WIDGET (f));
 
           for (i = 0; i < n_monitors; i++)
             if (gdk_display_get_monitor_at_window (gdpy, gwin)
                 == gdk_display_get_monitor (gdpy, i))
               break;
+#else
+	  GdkSurface *surface = FRAME_GDK_SURFACE (f);
+	  GdkMonitor *monitor
+	    = (surface && gdk_surface_get_mapped (surface)
+	       ? gdk_display_get_monitor_at_surface (gdpy, surface) : NULL);
+
+	  for (i = 0; i < n_monitors; i++)
+	    if (monitor == gdk_display_get_monitor (gdpy, i))
+	      break;
+
+	  /* Frames whose monitor isn't known are put on the first
+	     one.  */
+	  if (i == n_monitors)
+	    i = 0;
+	  if (n_monitors == 0)
+	    continue;
+#endif
 	  ASET (monitor_frames, i, Fcons (frame, AREF (monitor_frames, i)));
 	}
     }
@@ -2475,13 +2631,20 @@ Internal use only, use `display-monitor-attributes-list' instead.  */)
       double scale = 1;
 
       GdkMonitor *monitor = gdk_display_get_monitor (gdpy, i);
+#ifndef HAVE_GTK4
       if (gdk_monitor_is_primary (monitor))
         primary_monitor = i;
+#endif
       gdk_monitor_get_geometry (monitor, &rec);
 
       width_mm = gdk_monitor_get_width_mm (monitor);
       height_mm = gdk_monitor_get_height_mm (monitor);
+#ifndef HAVE_GTK4
       gdk_monitor_get_workarea (monitor, &work);
+#else
+      /* GDK 4 does not know the work area of monitors.  */
+      work = rec;
+#endif
 
       /* GTK returns scaled sizes for the workareas.  */
       scale = pgtk_get_monitor_scale_factor (gdk_monitor_get_model (monitor));
@@ -2525,6 +2688,11 @@ Internal use only, use `display-monitor-attributes-list' instead.  */)
 double
 pgtk_frame_scale_factor (struct frame *f)
 {
+#ifdef HAVE_GTK4
+  /* Emacs pixels are device pixels under GTK 4, so they need no
+     scaling; see FRAME_GTK_SCALE for the scale GTK uses.  */
+  return 1.0;
+#else
   struct pgtk_display_info *dpyinfo = FRAME_DISPLAY_INFO (f);
   GdkDisplay *gdpy = dpyinfo->gdpy;
 
@@ -2541,6 +2709,7 @@ pgtk_frame_scale_factor (struct frame *f)
   unblock_input ();
 
   return scale;
+#endif
 }
 
 DEFUN ("x-display-planes", Fx_display_planes, Sx_display_planes, 0, 1, 0,
@@ -2600,6 +2769,83 @@ unwind_create_tip_frame (Lisp_Object frame)
 }
 
 
+#ifdef HAVE_GTK4
+
+/* Tooltip frames are shown in popovers attached to the edit widget of
+   the frame they are for, since GTK 4 cannot position toplevel
+   windows.  */
+
+/* Remove the input region of the surface of the tooltip popover
+   WIDGET, so that the tooltip doesn't receive input, which would
+   cause it to be hidden as the pointer leaves the frame below it.
+   GtkPopover sets an input region whenever it is laid out, so this
+   must be called after that.  */
+
+static void
+pgtk_tip_surface_layout (GdkSurface *surface, int width, int height,
+			 gpointer user_data)
+{
+  cairo_region_t *region = cairo_region_create ();
+
+  gdk_surface_set_input_region (surface, region);
+  cairo_region_destroy (region);
+}
+
+static void
+pgtk_tip_realized (GtkWidget *widget, gpointer user_data)
+{
+  GdkSurface *surface = gtk_native_get_surface (GTK_NATIVE (widget));
+
+  g_signal_connect_after (surface, "layout",
+			  G_CALLBACK (pgtk_tip_surface_layout), NULL);
+}
+
+/* Create the widgets of the tooltip frame F, for frame P.  */
+
+static void
+pgtk_create_tip_widgets (struct frame *f, struct frame *p)
+{
+  static GtkCssProvider *provider;
+  GtkWidget *popover, *fixed;
+
+  if (!provider)
+    {
+      /* Remove the decorations of popovers from tooltips.  */
+      provider = gtk_css_provider_new ();
+      pgtk_load_css (provider,
+		     "popover.emacs-tooltip, popover.emacs-tooltip > contents {"
+		     " padding: 0; margin: 0; border: none;"
+		     " border-radius: 0; box-shadow: none;"
+		     " background: none; min-width: 0; min-height: 0; }");
+      gtk_style_context_add_provider_for_display
+	(FRAME_X_DISPLAY (f), GTK_STYLE_PROVIDER (provider),
+	 GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
+    }
+
+  FRAME_X_OUTPUT (f)->scale = FRAME_GTK_SCALE (p);
+
+  fixed = emacs_fixed_new (f);
+  FRAME_GTK_WIDGET (f) = fixed;
+  gtk_widget_set_focusable (fixed, FALSE);
+  gtk_widget_set_can_target (fixed, FALSE);
+
+  popover = gtk_popover_new ();
+  gtk_widget_add_css_class (popover, "emacs-tooltip");
+  gtk_popover_set_has_arrow (GTK_POPOVER (popover), FALSE);
+  gtk_popover_set_autohide (GTK_POPOVER (popover), FALSE);
+  gtk_popover_set_position (GTK_POPOVER (popover), GTK_POS_BOTTOM);
+  gtk_widget_set_halign (popover, GTK_ALIGN_START);
+  gtk_widget_set_can_target (popover, FALSE);
+  gtk_widget_set_can_focus (popover, FALSE);
+  gtk_popover_set_child (GTK_POPOVER (popover), fixed);
+  g_signal_connect (popover, "realize", G_CALLBACK (pgtk_tip_realized), NULL);
+
+  gtk_widget_set_parent (popover, FRAME_GTK_WIDGET (p));
+  FRAME_X_OUTPUT (f)->tip_popover = popover;
+}
+
+#endif /* HAVE_GTK4 */
+
 /* Create a frame for a tooltip on the display described by DPYINFO.
    PARMS is a list of frame parameters.  TEXT is the string to
    display in the tip frame.  Value is the frame.
@@ -2652,6 +2898,11 @@ pgtk_create_tip_frame (struct pgtk_display_info *dpyinfo, Lisp_Object parms, str
   f->tooltip = true;
   fset_icon_name (f, Qnil);
   FRAME_DISPLAY_INFO (f) = dpyinfo;
+#ifdef HAVE_GTK4
+  /* The tooltip is shown on the surface of P.  */
+  FRAME_X_OUTPUT (f)->scale = FRAME_GTK_SCALE (p);
+  FRAME_X_OUTPUT (f)->resolution = pgtk_frame_resolution (p);
+#endif
   f->output_data.pgtk->parent_desc = FRAME_DISPLAY_INFO (f)->root_window;
   f->output_data.pgtk->explicit_parent = false;
 
@@ -2756,6 +3007,7 @@ pgtk_create_tip_frame (struct pgtk_display_info *dpyinfo, Lisp_Object parms, str
 
   gui_figure_window_size (f, parms, false, false);
 
+#ifndef HAVE_GTK4
   xg_create_frame_widgets (f);
   pgtk_set_event_handler (f);
   tip_window = FRAME_GTK_OUTER_WIDGET (f);
@@ -2765,6 +3017,10 @@ pgtk_create_tip_frame (struct pgtk_display_info *dpyinfo, Lisp_Object parms, str
   gtk_window_set_destroy_with_parent (GTK_WINDOW (tip_window), TRUE);
   gtk_window_set_decorated (GTK_WINDOW (tip_window), FALSE);
   gtk_window_set_type_hint (GTK_WINDOW (tip_window), GDK_WINDOW_TYPE_HINT_TOOLTIP);
+#else
+  pgtk_create_tip_widgets (f, p);
+  tip_window = FRAME_X_OUTPUT (f)->tip_popover;
+#endif
   f->output_data.pgtk->current_cursor = f->output_data.pgtk->text_cursor;
 
   gui_default_parameter (f, parms, Qauto_raise, Qnil,
@@ -2870,12 +3126,46 @@ compute_tip_xy (struct frame *f, Lisp_Object parms, Lisp_Object dx,
   right = Fcdr (Fassq (Qright, parms));
   bottom = Fcdr (Fassq (Qbottom, parms));
 
+#ifdef HAVE_GTK4
+  /* GTK 4 cannot place windows on the screen, so the tooltip is placed
+     relative to the frame F it is for, and the compositor moves it if it
+     doesn't fit on the screen.  */
+  {
+    struct pgtk_display_info *dpyinfo = FRAME_DISPLAY_INFO (f);
+
+    if (dpyinfo->last_mouse_motion_frame == f)
+      {
+	*root_x = dpyinfo->last_mouse_motion_x;
+	*root_y = dpyinfo->last_mouse_motion_y;
+      }
+    else
+      *root_x = *root_y = 0;
+
+    if (FIXNUMP (top))
+      *root_y = XFIXNUM (top);
+    else if (FIXNUMP (bottom))
+      *root_y = XFIXNUM (bottom) - height;
+    else
+      *root_y += XFIXNUM (dy);
+
+    if (FIXNUMP (left))
+      *root_x = XFIXNUM (left);
+    else if (FIXNUMP (right))
+      *root_x = XFIXNUM (right) - width;
+    else
+      *root_x += XFIXNUM (dx);
+
+    return;
+  }
+#endif
+
   /* Move the tooltip window where the mouse pointer is.  Resize and
      show it.  */
   if ((!FIXNUMP (left) && !FIXNUMP (right))
       || (!FIXNUMP (top) && !FIXNUMP (bottom)))
     {
       Lisp_Object frame, attributes, monitor, geometry;
+#ifndef HAVE_GTK4
       GdkSeat *seat =
 	gdk_display_get_default_seat (FRAME_DISPLAY_INFO (f)->gdpy);
       GdkDevice *dev = gdk_seat_get_pointer (seat);
@@ -2884,6 +3174,7 @@ compute_tip_xy (struct frame *f, Lisp_Object parms, Lisp_Object dx,
       block_input ();
       gdk_device_get_position (dev, &scr, root_x, root_y);
       unblock_input ();
+#endif
 
       XSETFRAME (frame, f);
       attributes = Fpgtk_display_monitor_attributes_list (frame);
@@ -3037,6 +3328,27 @@ pgtk_hide_tip (bool delete)
     }
 }
 
+#ifdef HAVE_GTK4
+/* Place the tooltip frame TIP_F for frame F so that its top left
+   corner is at X, Y, relative to the edit widget of F.  */
+
+static void
+pgtk_place_tip (struct frame *f, struct frame *tip_f, int x, int y)
+{
+  GdkRectangle rect;
+  GtkWidget *popover = FRAME_X_OUTPUT (tip_f)->tip_popover;
+
+  rect.x = floor (PGTK_TO_LOGICAL (f, x));
+  rect.y = floor (PGTK_TO_LOGICAL (f, y));
+  rect.width = 1;
+  rect.height = 1;
+
+  gtk_popover_set_pointing_to (GTK_POPOVER (popover), &rect);
+  if (gtk_widget_get_visible (popover))
+    gtk_popover_present (GTK_POPOVER (popover));
+}
+#endif
+
 DEFUN ("x-show-tip", Fx_show_tip, Sx_show_tip, 1, 6, 0,
        doc: /* SKIP: real doc in xfns.c.  */)
   (Lisp_Object string, Lisp_Object frame, Lisp_Object parms,
@@ -3067,8 +3379,10 @@ DEFUN ("x-show-tip", Fx_show_tip, Sx_show_tip, 1, 6, 0,
     frame = selected_frame;
   f = decode_window_system_frame (frame);
 
+#ifndef HAVE_GTK4
   if (!FRAME_GTK_OUTER_WIDGET (f))
     return unbind_to (count, Qnil);
+#endif
 
   if (NILP (timeout))
     timeout = Vx_show_tooltip_timeout;
@@ -3117,9 +3431,18 @@ DEFUN ("x-show-tip", Fx_show_tip, Sx_show_tip, 1, 6, 0,
 	    }
 
 	  block_input ();
+#ifndef HAVE_GTK4
 	  compute_tip_xy (tip_f, parms, dx, dy, FRAME_PIXEL_WIDTH (tip_f),
 			  FRAME_PIXEL_HEIGHT (tip_f), &root_x, &root_y);
+#else
+	  compute_tip_xy (f, parms, dx, dy, FRAME_PIXEL_WIDTH (tip_f),
+			  FRAME_PIXEL_HEIGHT (tip_f), &root_x, &root_y);
+#endif
+#ifndef HAVE_GTK4
 	  gtk_window_move (GTK_WINDOW (FRAME_GTK_OUTER_WIDGET (tip_f)), root_x, root_y);
+#else
+	  pgtk_place_tip (f, tip_f, root_x, root_y);
+#endif
 	  unblock_input ();
 
 	  goto start_timer;
@@ -3207,8 +3530,10 @@ DEFUN ("x-show-tip", Fx_show_tip, Sx_show_tip, 1, 6, 0,
 	/* Creating the tip frame failed.  */
 	return unbind_to (count, Qnil);
     }
+#ifndef HAVE_GTK4
   else
     tip_window = FRAME_X_WINDOW (XFRAME (tip_frame));
+#endif
 
   tip_f = XFRAME (tip_frame);
   window = FRAME_ROOT_WINDOW (tip_f);
@@ -3292,16 +3617,35 @@ DEFUN ("x-show-tip", Fx_show_tip, Sx_show_tip, 1, 6, 0,
   width += FRAME_COLUMN_WIDTH (tip_f);
 
   /* Calculate position of tooltip frame.  */
+#ifndef HAVE_GTK4
   compute_tip_xy (tip_f, parms, dx, dy, width, height, &root_x, &root_y);
+#else
+  compute_tip_xy (f, parms, dx, dy, width, height, &root_x, &root_y);
+#endif
 
   /* Show tooltip frame.  */
   block_input ();
+#ifndef HAVE_GTK4
   gtk_window_resize (GTK_WINDOW (FRAME_GTK_OUTER_WIDGET (tip_f)), width, height);
   gtk_window_move (GTK_WINDOW (FRAME_GTK_OUTER_WIDGET (tip_f)), root_x, root_y);
   gtk_widget_show_all (FRAME_GTK_OUTER_WIDGET (tip_f));
   SET_FRAME_VISIBLE (tip_f, 1);
   gdk_window_set_cursor (gtk_widget_get_window (FRAME_GTK_OUTER_WIDGET (tip_f)),
 			 f->output_data.pgtk->current_cursor);
+#else
+  {
+    GtkWidget *fixed = FRAME_GTK_WIDGET (tip_f);
+    int lwidth = lrint (PGTK_TO_LOGICAL (tip_f, width));
+    int lheight = lrint (PGTK_TO_LOGICAL (tip_f, height));
+
+    FRAME_X_OUTPUT (tip_f)->preferred_width = lwidth;
+    FRAME_X_OUTPUT (tip_f)->preferred_height = lheight;
+    gtk_widget_set_size_request (fixed, lwidth, lheight);
+    pgtk_place_tip (f, tip_f, root_x, root_y);
+    gtk_popover_popup (GTK_POPOVER (FRAME_X_OUTPUT (tip_f)->tip_popover));
+    SET_FRAME_VISIBLE (tip_f, 1);
+  }
+#endif
 
   unblock_input ();
 
@@ -3351,6 +3695,7 @@ frame_geometry (Lisp_Object frame, Lisp_Object attribute)
   /* Get these here because they can't be got in configure_event(). */
   int left_pos, top_pos;
 
+#ifndef HAVE_GTK4
   if (FRAME_GTK_OUTER_WIDGET (f))
     gtk_window_get_position (GTK_WINDOW (FRAME_GTK_OUTER_WIDGET (f)),
 			     &left_pos, &top_pos);
@@ -3365,6 +3710,20 @@ frame_geometry (Lisp_Object frame, Lisp_Object attribute)
       left_pos = alloc.x;
       top_pos = alloc.y;
     }
+#else
+  if (FRAME_GTK_WIDGET (f) == NULL)
+    return Qnil;    /* This can occur while creating a frame.  */
+
+  /* The positions of toplevel windows are unknown under GTK 4.  Child
+     frames are where Emacs put them.  */
+  if (FRAME_GTK_OUTER_WIDGET (f))
+    left_pos = top_pos = 0;
+  else
+    {
+      left_pos = f->left_pos;
+      top_pos = f->top_pos;
+    }
+#endif
 
   int native_left = left_pos + border;
   int native_top = top_pos + border + title_height;
@@ -3501,6 +3860,7 @@ The coordinates X and Y are interpreted in pixels relative to a position
 \(0, 0) of the selected frame's display.  */)
   (Lisp_Object x, Lisp_Object y)
 {
+#ifndef HAVE_GTK4
   struct frame *f = SELECTED_FRAME ();
   GtkWidget *widget = gtk_widget_get_toplevel (FRAME_WIDGET (f));
   GdkWindow *window = gtk_widget_get_window (widget);
@@ -3510,7 +3870,9 @@ The coordinates X and Y are interpreted in pixels relative to a position
   GdkDevice *device = gdk_seat_get_pointer (seat);
 
   gdk_device_warp (device, gscr, XFIXNUM (x), XFIXNUM (y));	/* No effect on wayland. */
+#endif
 
+  /* GTK 4 cannot move the pointer.  */
   return Qnil;
 }
 
@@ -3523,6 +3885,7 @@ coordinates of the mouse cursor position in pixels relative to a
 position (0, 0) of the selected frame's terminal. */)
   (void)
 {
+#ifndef HAVE_GTK4
   struct frame *f = SELECTED_FRAME ();
   GtkWidget *widget = gtk_widget_get_toplevel (FRAME_WIDGET (f));
   GdkWindow *window = gtk_widget_get_window (widget);
@@ -3535,6 +3898,15 @@ position (0, 0) of the selected frame's terminal. */)
   gdk_device_get_position (device, &gscr, &x, &y);	/* can't get on wayland? */
 
   return Fcons (make_fixnum (x), make_fixnum (y));
+#else
+  /* GTK 4 only knows the position of the pointer within Emacs's
+     windows, whose position on the screen is unknown.  Report the
+     last position within a frame.  */
+  struct pgtk_display_info *dpyinfo = FRAME_DISPLAY_INFO (SELECTED_FRAME ());
+
+  return Fcons (make_fixnum (dpyinfo->last_mouse_motion_x),
+		make_fixnum (dpyinfo->last_mouse_motion_y));
+#endif
 }
 
 
@@ -3744,6 +4116,7 @@ DEFUN ("x-gtk-debug", Fx_gtk_debug, Sx_gtk_debug, 1, 1, 0,
   return NILP (enable) ? Qnil : Qt;
 }
 
+#ifndef HAVE_GTK4
 static void
 unwind_gerror_ptr (void* data)
 {
@@ -3751,6 +4124,7 @@ unwind_gerror_ptr (void* data)
   if (error)
     g_error_free (error);
 }
+#endif
 
 DEFUN ("x-gtk-launch-uri", Fx_gtk_launch_uri, Sx_gtk_launch_uri, 2, 2, 0,
        doc: /* Tell GTK to launch the default application to show given URI.
@@ -3766,6 +4140,7 @@ This function is only available on PGTK.  */)
     error ("GTK URI launch not available for this frame");
 
   CHECK_STRING (uri);
+#ifndef HAVE_GTK4
   guint32 timestamp = gtk_get_current_event_time ();
 
   GError *err = NULL;
@@ -3782,6 +4157,16 @@ This function is only available on PGTK.  */)
     error ("Failed to launch URI via GTK: %s", err->message);
 
   return unbind_to (count, Qnil);
+#else
+  /* The URI is launched asynchronously; errors are not reported.  */
+  GtkUriLauncher *launcher = gtk_uri_launcher_new (SSDATA (uri));
+
+  gtk_uri_launcher_launch (launcher,
+			   GTK_WINDOW (FRAME_GTK_OUTER_WIDGET (XFRAME (frame))),
+			   NULL, NULL, NULL);
+  g_object_unref (launcher);
+  return Qnil;
+#endif
 }
 
 void

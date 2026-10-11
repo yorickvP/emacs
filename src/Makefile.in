@@ -481,7 +481,7 @@ SOME_MACHINE_OBJECTS = dosfns.o msdos.o \
   nsxwidget.o \
   w32.o w32console.o w32cygwinx.o w32fns.o w32heap.o w32inevt.o w32notify.o \
   w32menu.o w32proc.o w32reg.o w32select.o w32term.o w32xfns.o \
-  w16select.o widget.o xfont.o ftfont.o xftfont.o gtkutil.o \
+  w16select.o widget.o xfont.o ftfont.o xftfont.o gtkutil.o gtk4util.o \
   xsettings.o xgselect.o termcap.o hbfont.o \
   haikuterm.o haikufns.o haikumenu.o haikufont.o androidterm.o androidfns.o \
   androidfont.o androidselect.c androidvfs.c sfntfont-android.c sfntfont.c

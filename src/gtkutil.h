@@ -25,6 +25,13 @@ along with GNU Emacs.  If not, see <https://www.gnu.org/licenses/>.  */
 
 #include <gtk/gtk.h>
 #include "../lwlib/lwlib-widget.h"
+#ifdef HAVE_GTK4
+/* GTK 4 is only supported with the pgtk window system.  The toolkit
+   functions declared here are implemented in gtk4util.c.  */
+# ifndef HAVE_PGTK
+#  error "GTK 4 requires the pgtk window system"
+# endif
+#endif
 #ifdef HAVE_PGTK
 #include "pgtkterm.h"
 #define EVENT GdkEvent
@@ -69,6 +76,16 @@ typedef struct xg_menu_cb_data_
   int           menu_bar_items_used;
   GCallback     highlight_cb;
   int           ref_count;
+#ifdef HAVE_GTK4
+  /* The callback run when an item in the menu is selected, and the
+     action group holding the actions for the menu's items.  */
+  GCallback     select_cb;
+  GSimpleActionGroup *actions;
+  /* The number of actions added to ACTIONS so far.  */
+  int           n_actions;
+  /* The menu bar or popup menu the data is for.  */
+  GtkWidget     *widget;
+#endif
 } xg_menu_cb_data;
 
 /* This structure holds callback information for each individual menu item.  */
@@ -111,7 +128,9 @@ extern void xg_modify_menubar_widgets (GtkWidget *menubar,
 
 extern void xg_update_frame_menubar (struct frame *f);
 
+#ifndef HAVE_GTK4
 extern bool xg_event_is_for_menubar (struct frame *, const EVENT *);
+#endif
 
 extern ptrdiff_t xg_get_scroll_id_for_window (Display *dpy, Window wid);
 
@@ -148,8 +167,10 @@ extern void xg_set_toolkit_horizontal_scroll_bar_thumb (struct scroll_bar *bar,
 							int portion,
 							int position,
 							int whole);
+#ifndef HAVE_GTK4
 extern bool xg_event_is_for_scrollbar (struct frame *, const EVENT *,
 				       bool for_valuator);
+#endif
 extern int xg_get_default_scrollbar_width (struct frame *f);
 extern int xg_get_default_scrollbar_height (struct frame *f);
 
@@ -184,6 +205,14 @@ extern void xg_set_background_color (struct frame *f, unsigned long bg);
 extern bool xg_check_special_colors (struct frame *f,
 				     const char *color_name,
 				     Emacs_Color *color);
+#ifdef HAVE_GTK4
+extern void xg_show_popup_menu (struct frame *, GtkWidget *, int, int);
+extern void xg_destroy_popup_menu (GtkWidget *);
+extern void xg_menubar_open (struct frame *);
+extern GdkTexture *xg_texture_from_surface (cairo_surface_t *);
+extern void xg_set_frame_icon_name (struct frame *);
+extern void xg_frame_scale_changed (struct frame *);
+#endif
 #ifdef HAVE_PGTK
 extern void xg_create_frame_outer_widgets (struct frame *f);
 extern void xg_set_gtk_theme_dark_mode (bool dark_mode_p, GtkSettings *settings);

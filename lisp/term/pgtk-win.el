@@ -336,6 +336,43 @@ This uses `icon-map-list' to map icon file names to stock icon names."
 
 (declare-function accelerate-menu "pgtkmenu.c" (&optional frame) t)
 
+(declare-function pgtk-frame-resolution "pgtkterm.c" (&optional frame))
+
+(defun pgtk--frame-resolution-changed (frame)
+  "Reopen the fonts of FRAME after its resolution changed.
+Emacs built with GTK 4 calls this when FRAME is moved to a monitor
+with a different scale factor, since its pixels are device pixels.
+Reopen the default font of FRAME at the same size in points, so that
+text keeps its size on the screen."
+  (when (and (frame-live-p frame)
+             (fboundp 'pgtk-frame-resolution))
+    ;; This also tells Emacs that the change has been handled.
+    (pgtk-frame-resolution frame)
+    (let ((height (face-attribute 'default :height frame t))
+          (font (frame-parameter frame 'font))
+          ;; The height of the default face is recomputed from the size
+          ;; in pixels of the font opened for it, so it changes slightly
+          ;; every time the font is reopened.  Use the height it had
+          ;; before that, unless it was changed since.
+          (saved (frame-parameter frame 'pgtk--default-face-height)))
+      (when (and (consp saved) (eql height (cdr saved)))
+        (setq height (car saved)))
+      (when (and (integerp height) (stringp font))
+        (let ((spec (ignore-errors (font-spec :name font))))
+          (when spec
+            ;; A float size is in points, which an XLFD name keeps.
+            (font-put spec :name nil)
+            (font-put spec :size (/ height 10.0))
+            (modify-frame-parameters frame
+                                     `((font . ,(font-xlfd-name spec))))
+            (set-frame-parameter frame 'pgtk--default-face-height
+                                 (cons height
+                                       (face-attribute 'default :height
+                                                       frame t)))
+            (unless (equal font (frame-parameter frame 'font))
+              ;; Other faces are realized using the old resolution.
+              (clear-face-cache))))))))
+
 (defun pgtk-menu-bar-open (&optional frame)
   "Open the menu bar if it is shown.
 `popup-menu' is used if it is off."

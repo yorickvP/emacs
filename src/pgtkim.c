@@ -20,6 +20,8 @@ along with GNU Emacs.  If not, see <https://www.gnu.org/licenses/>.  */
 
 #include <config.h>
 
+#include <math.h>
+
 #include "pgtkterm.h"
 
 static void
@@ -174,9 +176,14 @@ pgtk_im_focus_in (struct frame *f)
   if (dpyinfo->im.context != NULL)
     {
       gtk_im_context_reset (dpyinfo->im.context);
+#ifndef HAVE_GTK4
       gtk_im_context_set_client_window (dpyinfo->im.context,
 					gtk_widget_get_window
 					(FRAME_GTK_WIDGET (f)));
+#else
+      gtk_im_context_set_client_widget (dpyinfo->im.context,
+					FRAME_GTK_WIDGET (f));
+#endif
       gtk_im_context_focus_in (dpyinfo->im.context);
     }
   dpyinfo->im.focused_frame = f;
@@ -192,18 +199,34 @@ pgtk_im_focus_out (struct frame *f)
 	{
 	  gtk_im_context_reset (dpyinfo->im.context);
 	  gtk_im_context_focus_out (dpyinfo->im.context);
+#ifndef HAVE_GTK4
 	  gtk_im_context_set_client_window (dpyinfo->im.context, NULL);
+#else
+	  gtk_im_context_set_client_widget (dpyinfo->im.context, NULL);
+#endif
 	}
       dpyinfo->im.focused_frame = NULL;
     }
 }
 
 bool
+#ifndef HAVE_GTK4
 pgtk_im_filter_keypress (struct frame *f, GdkEventKey * ev)
+#else
+pgtk_im_filter_keypress (struct frame *f, GdkEvent *ev)
+#endif
 {
   struct pgtk_display_info *dpyinfo = FRAME_DISPLAY_INFO (f);
   if (dpyinfo->im.context != NULL)
     {
+#ifdef HAVE_GTK4
+      /* GTK 4 input method contexts do nothing without a client
+	 widget, which is set when F gets the focus.  Key presses can
+	 arrive without that having been reported, for instance when F
+	 already had the focus when it was created.  */
+      if (dpyinfo->im.focused_frame != f)
+	pgtk_im_focus_in (f);
+#endif
       if (gtk_im_context_filter_keypress (dpyinfo->im.context, ev))
 	return true;
     }
@@ -217,7 +240,16 @@ pgtk_im_set_cursor_location (struct frame *f, int x, int y, int width,
   struct pgtk_display_info *dpyinfo = FRAME_DISPLAY_INFO (f);
   if (dpyinfo->im.context != NULL && dpyinfo->im.focused_frame == f)
     {
+#ifndef HAVE_GTK4
       GdkRectangle area = { x, y, width, height };
+#else
+      /* The location is in logical pixels relative to the edit
+	 widget.  */
+      GdkRectangle area = { floor (PGTK_TO_LOGICAL (f, x)),
+			    floor (PGTK_TO_LOGICAL (f, y)),
+			    ceil (PGTK_TO_LOGICAL (f, width)),
+			    ceil (PGTK_TO_LOGICAL (f, height)) };
+#endif
       gtk_im_context_set_cursor_location (dpyinfo->im.context, &area);
     }
 }
@@ -231,7 +263,11 @@ pgtk_im_use_context (struct pgtk_display_info *dpyinfo, bool use_p)
 	{
 	  gtk_im_context_reset (dpyinfo->im.context);
 	  gtk_im_context_focus_out (dpyinfo->im.context);
+#ifndef HAVE_GTK4
 	  gtk_im_context_set_client_window (dpyinfo->im.context, NULL);
+#else
+	  gtk_im_context_set_client_widget (dpyinfo->im.context, NULL);
+#endif
 
 	  g_object_unref (dpyinfo->im.context);
 	  dpyinfo->im.context = NULL;

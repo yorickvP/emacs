@@ -78,6 +78,7 @@ DEFUN ("x-menu-bar-open-internal", Fx_menu_bar_open_internal, Sx_menu_bar_open_i
   menubar = FRAME_X_OUTPUT (f)->menubar_widget;
   if (menubar)
     {
+#ifndef HAVE_GTK4
       /* Activate the first menu.  */
       GList *children = gtk_container_get_children (GTK_CONTAINER (menubar));
 
@@ -86,6 +87,9 @@ DEFUN ("x-menu-bar-open-internal", Fx_menu_bar_open_internal, Sx_menu_bar_open_i
 	  g_signal_emit_by_name (children->data, "activate_item");
 	  g_list_free (children);
 	}
+#else
+      xg_menubar_open (f);
+#endif
     }
   unblock_input ();
 
@@ -102,7 +106,11 @@ popup_widget_loop (bool do_timers, GtkWidget *widget)
 
   /* Process events in the Gtk event loop until done.  */
   while (popup_activated_flag)
+#ifndef HAVE_GTK4
     gtk_main_iteration ();
+#else
+    g_main_context_iteration (NULL, TRUE);
+#endif
 }
 
 void
@@ -195,6 +203,7 @@ menubar_selection_callback (GtkWidget *widget, gpointer client_data)
      is active after the selection.  For C-h k this means we get the help on
      the deselected item and then the selected item is executed.  Prevent that
      by ignoring the non-active item.  */
+#ifndef HAVE_GTK4
   if (GTK_IS_RADIO_MENU_ITEM (widget)
       && !gtk_check_menu_item_get_active (GTK_CHECK_MENU_ITEM (widget)))
     return;
@@ -209,6 +218,7 @@ menubar_selection_callback (GtkWidget *widget, gpointer client_data)
   while (gtk_events_pending ())
     gtk_main_iteration ();
   unblock_input ();
+#endif
 
   find_and_call_menu_selection (cb_data->cl_data->f,
 				cb_data->cl_data->menu_bar_items_used,
@@ -517,7 +527,14 @@ pop_down_menu (void *arg)
 {
   popup_activated_flag = 0;
   block_input ();
+#ifndef HAVE_GTK4
   gtk_widget_destroy (GTK_WIDGET (arg));
+#else
+  if (GTK_IS_WINDOW (arg))
+    gtk_window_destroy (GTK_WINDOW (arg));
+  else
+    xg_destroy_popup_menu (GTK_WIDGET (arg));
+#endif
   unblock_input ();
 }
 
@@ -541,6 +558,7 @@ create_and_show_popup_menu (struct frame *f, widget_value * first_wv,
   xg_crazy_callback_abort = false;
 
   /* Display the menu.  */
+#ifndef HAVE_GTK4
   gtk_widget_show_all (menu);
 
   if (for_click)
@@ -559,10 +577,18 @@ create_and_show_popup_menu (struct frame *f, widget_value * first_wv,
 			      GDK_GRAVITY_NORTH_WEST, GDK_GRAVITY_NORTH_WEST,
 			      FRAME_DISPLAY_INFO (f)->last_click_event);
     }
+#else
+  /* X and Y are where the mouse was clicked if FOR_CLICK.  */
+  xg_show_popup_menu (f, menu, x, y);
+#endif
 
   record_unwind_protect_ptr (pop_down_menu, menu);
 
+#ifndef HAVE_GTK4
   if (gtk_widget_get_mapped (menu))
+#else
+  if (gtk_widget_get_visible (menu))
+#endif
     {
       /* Set this to one.  popup_widget_loop increases it by one, so it becomes
          two.  show_help_echo uses this to detect popup menus.  */
@@ -875,7 +901,11 @@ create_and_show_dialog (struct frame *f, widget_value *first_wv)
       record_unwind_protect_ptr (pop_down_menu, menu);
 
       /* Display the menu.  */
+#ifndef HAVE_GTK4
       gtk_widget_show_all (menu);
+#else
+      gtk_window_present (GTK_WINDOW (menu));
+#endif
 
       /* Process events that apply to the menu.  */
       popup_widget_loop (true, menu);

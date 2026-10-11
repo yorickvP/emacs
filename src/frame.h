@@ -991,10 +991,26 @@ default_pixels_per_inch_y (void)
 
 #ifdef HAVE_WINDOW_SYSTEM
 
+#if defined HAVE_PGTK && defined HAVE_GTK4
+
+/* Under GTK 4, Emacs pixels are device pixels, so frames displayed on
+   monitors with different scales have different resolutions.  */
+
+extern double pgtk_frame_resolution (struct frame *);
+
+#define FRAME_RES_X(f)						\
+  (eassert (FRAME_WINDOW_P (f)), pgtk_frame_resolution (f))
+#define FRAME_RES_Y(f)						\
+  (eassert (FRAME_WINDOW_P (f)), pgtk_frame_resolution (f))
+
+#else /* !(HAVE_PGTK && HAVE_GTK4) */
+
 #define FRAME_RES_X(f)						\
   (eassert (FRAME_WINDOW_P (f)), FRAME_DISPLAY_INFO (f)->resx)
 #define FRAME_RES_Y(f)						\
   (eassert (FRAME_WINDOW_P (f)), FRAME_DISPLAY_INFO (f)->resy)
+
+#endif /* !(HAVE_PGTK && HAVE_GTK4) */
 
 #ifdef HAVE_ANDROID
 
