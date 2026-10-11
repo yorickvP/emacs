@@ -30,6 +30,10 @@ in
     p: !(lib.isDerivation p && lib.hasPrefix "CVE-" p.name)
   ) old.patches;
 
+  # Keep debug info in a separate "debug" output, so that crashes can be
+  # decoded; see README-gtk4.md.
+  separateDebugInfo = true;
+
   configureFlags = old.configureFlags ++ [ "--with-gtk4" ];
   buildInputs = lib.subtractLists [ pkgs.gtk3 ] old.buildInputs ++ [ pkgs.gtk4 ];
   nativeBuildInputs =
