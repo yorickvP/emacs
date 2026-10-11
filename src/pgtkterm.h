@@ -554,11 +554,6 @@ struct pgtk_output
      is that of its display.  */
   double resolution;
 
-  /* The default size last given to the toplevel window, and the size
-     its contents were to get with it, in logical pixels.  */
-  int last_default_width, last_default_height;
-  int last_content_width, last_content_height;
-
   /* Whether the fonts of the frame are to be reopened because its
      resolution changed.  */
   bool_bf rescale_pending : 1;

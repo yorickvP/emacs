@@ -343,12 +343,14 @@ This uses `icon-map-list' to map icon file names to stock icon names."
 Emacs built with GTK 4 calls this when FRAME is moved to a monitor
 with a different scale factor, since its pixels are device pixels.
 Reopen the default font of FRAME at the same size in points, so that
-text keeps its size on the screen."
+text keeps its size on the screen.  Like other programs, keep the size
+of the window on the screen too, which changes the number of columns
+and lines that fit in it a little."
   (when (and (frame-live-p frame)
              (fboundp 'pgtk-frame-resolution))
     ;; This also tells Emacs that the change has been handled.
-    (pgtk-frame-resolution frame)
-    (let ((height (face-attribute 'default :height frame t))
+    (let ((resolution (pgtk-frame-resolution frame))
+          (height (face-attribute 'default :height frame t))
           (font (frame-parameter frame 'font))
           ;; The height of the default face is recomputed from the size
           ;; in pixels of the font opened for it, so it changes slightly
@@ -359,12 +361,23 @@ text keeps its size on the screen."
         (setq height (car saved)))
       (when (and (integerp height) (stringp font))
         (let ((spec (ignore-errors (font-spec :name font))))
-          (when spec
+          (when (and spec
+                     ;; The resolution can change only briefly, as when
+                     ;; a frame is first shown.  Leave the font alone if
+                     ;; it would be reopened at the same size in pixels,
+                     ;; lest that cancel a pending resize of the frame.
+                     (not (eql (font-get spec :size)
+                               (floor (+ (/ (* height resolution) 720.0)
+                                         0.5)))))
             ;; A float size is in points, which an XLFD name keeps.
             (font-put spec :name nil)
             (font-put spec :size (/ height 10.0))
-            (modify-frame-parameters frame
-                                     `((font . ,(font-xlfd-name spec))))
+            ;; Resizing the window instead would also race with the
+            ;; resize of the frame to the new size of the window in
+            ;; device pixels, which is still pending.
+            (let ((frame-inhibit-implied-resize t))
+              (modify-frame-parameters frame
+                                       `((font . ,(font-xlfd-name spec)))))
             (set-frame-parameter frame 'pgtk--default-face-height
                                  (cons height
                                        (face-attribute 'default :height

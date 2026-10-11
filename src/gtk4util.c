@@ -466,9 +466,16 @@ xg_hide_tooltip (struct frame *f)
 void
 xg_frame_resized (struct frame *f, int width, int height)
 {
-  /* Ignore case where size of native rectangle didn't change.  */
+  /* Ignore case where size of native rectangle didn't change, unless
+     the window manager refused to resize the window after the font
+     changed, which leaves the numbers of columns and lines to be
+     recomputed.  */
   if (width != FRAME_PIXEL_WIDTH (f)
       || height != FRAME_PIXEL_HEIGHT (f)
+      || (FRAME_COLS (f)
+	  != FRAME_PIXEL_TO_TEXT_WIDTH (f, width) / FRAME_COLUMN_WIDTH (f))
+      || (FRAME_LINES (f)
+	  != FRAME_PIXEL_TO_TEXT_HEIGHT (f, height) / FRAME_LINE_HEIGHT (f))
       || (f->new_size_p
 	  && ((f->new_width >= 0 && width != f->new_width)
 	      || (f->new_height >= 0 && height != f->new_height))))
@@ -525,6 +532,37 @@ xg_frame_bars_size (struct frame *f, int *width, int *height)
       }
 }
 
+/* Return the logical height of the title bar GTK draws itself in the
+   window of frame F, or 0 if there is none.  */
+
+static int
+xg_frame_title_bar_height (struct frame *f)
+{
+  GtkWidget *window = FRAME_GTK_OUTER_WIDGET (f);
+  GtkWidget *child;
+  int height = 0, nat;
+
+  if (!gtk_window_get_decorated (GTK_WINDOW (window))
+      || gtk_window_is_fullscreen (GTK_WINDOW (window)))
+    return 0;
+
+  /* The title bar is the child of the window besides its contents;
+     popovers and other native children don't count.  */
+  for (child = gtk_widget_get_first_child (window); child;
+       child = gtk_widget_get_next_sibling (child))
+    if (child != f->output_data.pgtk->vbox_widget
+	&& !GTK_IS_NATIVE (child)
+	&& gtk_widget_get_visible (child)
+	&& gtk_widget_get_child_visible (child))
+      {
+	gtk_widget_measure (child, GTK_ORIENTATION_VERTICAL, -1,
+			    NULL, &nat, NULL, NULL);
+	height += nat;
+      }
+
+  return height;
+}
+
 /* Ask GTK to make the edit widget of frame F WIDTH by HEIGHT device
    pixels.  Return true if the request was made through the toplevel
    window, which might not be honored by the window manager.  */
@@ -534,8 +572,10 @@ xg_request_frame_size (struct frame *f, int width, int height)
 {
   Lisp_Object fullscreen = get_frame_param (f, Qfullscreen);
   double scale = FRAME_GTK_SCALE (f);
-  int lwidth = max (1, lrint (width / scale));
-  int lheight = max (1, lrint (height / scale));
+  /* Round up, lest the edit widget end up a device pixel short of
+     what was asked for and lose a column or line.  */
+  int lwidth = max (1, (int) ceil (width / scale - 0.001));
+  int lheight = max (1, (int) ceil (height / scale - 0.001));
   GtkWidget *fixed = FRAME_GTK_WIDGET (f);
 
   /* The natural size of the edit widget is the size Emacs wants.  It
@@ -549,59 +589,52 @@ xg_request_frame_size (struct frame *f, int width, int height)
     {
       struct pgtk_output *x = f->output_data.pgtk;
       GtkWindow *window = GTK_WINDOW (FRAME_GTK_OUTER_WIDGET (f));
-      int vwidth = gtk_widget_get_width (x->vbox_widget);
-      int vheight = gtk_widget_get_height (x->vbox_widget);
-      int dwidth, dheight, bars_width, bars_height, delta;
+      int dwidth, dheight, bars_width, bars_height;
 
-      gtk_window_get_default_size (window, &dwidth, &dheight);
-
-      /* Once the window has been laid out, its default size tracks its
-	 current size, which is that of its contents plus any title bar
-	 GTK draws.  So resize it by the difference between the current
-	 and desired sizes of its contents, the edit widget and the
-	 bars around it.  Before that, the natural size set above is
-	 used.  */
-      if (vwidth > 0 && vheight > 0 && dwidth > 0 && dheight > 0)
+      /* Once the window has been laid out, set its default size,
+	 which applies to it from then on, to that of its contents,
+	 the edit widget and the bars around it, plus any title bar GTK
+	 draws.  Before that, the natural size set above is used.  */
+      if (gtk_widget_get_width (x->vbox_widget) > 0)
 	{
+	  gtk_window_get_default_size (window, &dwidth, &dheight);
 	  xg_frame_bars_size (f, &bars_width, &bars_height);
-
-	  /* The allocation of the contents lags behind the requests
-	     made since the window was last laid out.  While its
-	     default size is still the one requested last, assume
-	     that request will be honored.  */
-	  if (dwidth == x->last_default_width
-	      && dheight == x->last_default_height)
-	    {
-	      vwidth = x->last_content_width;
-	      vheight = x->last_content_height;
-	    }
 
 	  if (!(EQ (fullscreen, Qfullwidth)
 		&& width == FRAME_PIXEL_WIDTH (f)))
-	    {
-	      delta = max (1, dwidth + lwidth + bars_width - vwidth) - dwidth;
-	      dwidth += delta;
-	      vwidth += delta;
-	    }
+	    dwidth = lwidth + bars_width;
 	  if (!(EQ (fullscreen, Qfullheight)
 		&& height == FRAME_PIXEL_HEIGHT (f)))
-	    {
-	      delta = max (1, dheight + lheight + bars_height - vheight) - dheight;
-	      dheight += delta;
-	      vheight += delta;
-	    }
+	    dheight = lheight + bars_height + xg_frame_title_bar_height (f);
 
-	  gtk_window_set_default_size (window, dwidth, dheight);
-	  x->last_default_width = dwidth;
-	  x->last_default_height = dheight;
-	  x->last_content_width = vwidth;
-	  x->last_content_height = vheight;
+	  gtk_window_set_default_size (window, max (1, dwidth),
+				       max (1, dheight));
 	}
 
       return true;
     }
 
   return false;
+}
+
+/* Return whether the window of frame F gets the size it asks for,
+   instead of one the compositor chooses, as for maximized and tiled
+   windows.  */
+
+static bool
+xg_frame_sizes_window_p (struct frame *f)
+{
+  GdkSurface *surface = FRAME_GDK_SURFACE (f);
+
+  return (surface && GDK_IS_TOPLEVEL (surface)
+	  && !(gdk_toplevel_get_state (GDK_TOPLEVEL (surface))
+	       & (GDK_TOPLEVEL_STATE_MAXIMIZED
+		  | GDK_TOPLEVEL_STATE_FULLSCREEN
+		  | GDK_TOPLEVEL_STATE_TILED
+		  | GDK_TOPLEVEL_STATE_TOP_TILED
+		  | GDK_TOPLEVEL_STATE_RIGHT_TILED
+		  | GDK_TOPLEVEL_STATE_BOTTOM_TILED
+		  | GDK_TOPLEVEL_STATE_LEFT_TILED)));
 }
 
 /** Resize the outer window of frame F.  WIDTH and HEIGHT are the new
@@ -616,10 +649,13 @@ xg_frame_set_char_size (struct frame *f, int width, int height)
   SET_FRAME_GARBAGED (f);
   cancel_mouse_face (f);
 
-  /* We can not call change_frame_size for a mapped frame, since the
-     window manager may override our resize request; wait for the edit
-     widget to be allocated instead.  For unmapped windows and child
-     frames, set rows/cols now.  */
+  /* The window manager may override our resize request for a mapped
+     frame, so its size is only known once the edit widget has been
+     allocated.  Until then, assume a window whose size is ours to
+     choose gets the size asked for, so that changes made to the frame
+     meanwhile, like adding a tool bar, build on that size instead of
+     undoing the request.  The allocation corrects any mistake.  For
+     unmapped windows and child frames, set rows/cols now.  */
   if (FRAME_VISIBLE_P (f) && !FRAME_PARENT_FRAME (f))
     {
       if (CONSP (frame_size_history))
@@ -627,6 +663,11 @@ xg_frame_set_char_size (struct frame *f, int width, int height)
 	  (f, build_string ("xg_frame_set_char_size, visible"),
 	   FRAME_PIXEL_WIDTH (f), FRAME_PIXEL_HEIGHT (f), width, height,
 	   f->new_width, f->new_height);
+
+      if (xg_frame_sizes_window_p (f))
+	adjust_frame_size (f, FRAME_PIXEL_TO_TEXT_WIDTH (f, width),
+			   FRAME_PIXEL_TO_TEXT_HEIGHT (f, height),
+			   5, 0, Qxg_frame_set_char_size);
     }
   else
     {
