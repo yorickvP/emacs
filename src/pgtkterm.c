@@ -172,6 +172,39 @@ pgtk_seat_removed_cb (GdkDisplay *dpy, GdkSeat *seat,
 					user_data);
 }
 
+/* Return the number `pgtk-device-class' knows input source SOURCE
+   by, which is its number under GTK 3.  GTK 4 has no eraser and
+   cursor sources, and numbers the others differently.  */
+
+static unsigned int
+pgtk_input_source_number (GdkInputSource source)
+{
+#ifndef HAVE_GTK4
+  return source;
+#else
+  switch (source)
+    {
+    case GDK_SOURCE_MOUSE:
+      return 0;
+    case GDK_SOURCE_PEN:
+      return 1;
+    case GDK_SOURCE_KEYBOARD:
+      return 4;
+    case GDK_SOURCE_TOUCHSCREEN:
+      return 5;
+    case GDK_SOURCE_TOUCHPAD:
+      return 6;
+    case GDK_SOURCE_TRACKPOINT:
+      return 7;
+    case GDK_SOURCE_TABLET_PAD:
+      return 8;
+    default:
+      /* Unknown to `pgtk-device-class'.  */
+      return 100 + source;
+    }
+#endif
+}
+
 static void
 pgtk_enumerate_devices (struct pgtk_display_info *dpyinfo,
 			bool initial_p)
@@ -219,7 +252,9 @@ pgtk_enumerate_devices (struct pgtk_display_info *dpyinfo,
 	      rec->device = GDK_DEVICE (t1->data);
 	      source = gdk_device_get_source (rec->device);
 	      name = gdk_device_get_name (rec->device);
-	      rec->name = make_formatted_string ("%u:%s", source, name);
+	      rec->name = make_formatted_string ("%u:%s",
+						 pgtk_input_source_number (source),
+						 name);
 	    }
 	  else
 	    {
@@ -8220,6 +8255,7 @@ pgtk_scroll (struct frame *frame, GdkEvent *event)
   struct pgtk_display_info *dpyinfo = FRAME_DISPLAY_INFO (frame);
   GdkScrollDirection dir;
   double delta_x, delta_y;
+  bool wheel;
   int x, y;
 
   EVENT_INIT (inev.ie);
@@ -8251,102 +8287,133 @@ pgtk_scroll (struct frame *frame, GdkEvent *event)
     }
 
   dir = gdk_scroll_event_get_direction (event);
+  gdk_scroll_event_get_deltas (event, &delta_x, &delta_y);
+  wheel = gdk_scroll_event_get_unit (event) == GDK_SCROLL_UNIT_WHEEL;
 
-  if (dir != GDK_SCROLL_SMOOTH)
+  /* Mouse wheels report how many detents they turned, which can be a
+     fraction of one for high resolution wheels.  Older compositors
+     only report whole detents, in the direction of the event.  */
+  if (wheel && delta_x == 0 && delta_y == 0)
+    switch (dir)
+      {
+      case GDK_SCROLL_UP:
+	delta_y = -1;
+	break;
+      case GDK_SCROLL_DOWN:
+	delta_y = 1;
+	break;
+      case GDK_SCROLL_LEFT:
+	delta_x = -1;
+	break;
+      case GDK_SCROLL_RIGHT:
+	delta_x = 1;
+	break;
+      default:
+	break;
+      }
+
+  if (!mwheel_coalesce_scroll_events)
     {
-      switch (dir)
+      /* Report the distance to scroll in frame pixels.  Like GTK,
+	 scroll a wheel by the height of the window under the mouse to
+	 the power of 2/3 per detent, and follow the fingers on a
+	 touchpad exactly.  */
+      double scale = FRAME_GTK_SCALE (f);
+      double unit = scale;
+
+      if (wheel)
 	{
-	case GDK_SCROLL_UP:
-	  inev.ie.kind = WHEEL_EVENT;
-	  inev.ie.modifiers |= up_modifier;
-	  break;
-	case GDK_SCROLL_DOWN:
-	  inev.ie.kind = WHEEL_EVENT;
-	  inev.ie.modifiers |= down_modifier;
-	  break;
-	case GDK_SCROLL_LEFT:
-	  inev.ie.kind = HORIZ_WHEEL_EVENT;
-	  inev.ie.modifiers |= up_modifier;
-	  break;
-	case GDK_SCROLL_RIGHT:
-	  inev.ie.kind = HORIZ_WHEEL_EVENT;
-	  inev.ie.modifiers |= down_modifier;
-	  break;
-	default:
-	  break;
+	  Lisp_Object window
+	    = window_from_coordinates (f, x, y, NULL, false, false, false);
+	  double height = (WINDOWP (window)
+			   ? XWINDOW (window)->pixel_height
+			   : FRAME_PIXEL_HEIGHT (f));
+
+	  unit = pow (height / scale, 2.0 / 3.0) * scale;
 	}
+
+      if (NUMBERP (Vpgtk_scroll_event_delta_factor))
+	unit *= XFLOATINT (Vpgtk_scroll_event_delta_factor);
+
+      delta_x *= unit;
+      delta_y *= unit;
+
+      if (delta_x == 0 && delta_y == 0)
+	return;
+
+      inev.ie.kind = ((fabs (delta_x) > fabs (delta_y))
+		      ? HORIZ_WHEEL_EVENT
+		      : WHEEL_EVENT);
+      inev.ie.modifiers |= (inev.ie.kind == HORIZ_WHEEL_EVENT
+			    ? (delta_x >= 0 ? up_modifier : down_modifier)
+			    : (delta_y >= 0 ? down_modifier : up_modifier));
+      inev.ie.arg = list3 (Qnil, make_float (-delta_x),
+			   make_float (-delta_y));
     }
   else
     {
-      gdk_scroll_event_get_deltas (event, &delta_x, &delta_y);
-
-      /* Deltas of touchpads and other continuous scroll devices are in
-	 surface pixels under GDK 4, but they were in units ten times as
-	 large under GDK 3, which this code was written for.  */
-      if (gdk_scroll_event_get_unit (event) == GDK_SCROLL_UNIT_SURFACE)
+      /* Count lines and columns as Emacs did under GTK 3, where a
+	 detent counted as one, and ten pixels of touchpad movement
+	 did.  High resolution wheels must not scroll a line for every
+	 fraction of a detent.  */
+      if (!wheel)
 	{
 	  delta_x /= 10;
 	  delta_y /= 10;
 	}
 
-      if (!mwheel_coalesce_scroll_events)
+      /* Forget what was left over from scrolling the other way.  */
+      if (delta_x != 0
+	  && signbit (delta_x) != signbit (dpyinfo->scroll.acc_x))
+	dpyinfo->scroll.acc_x = 0;
+      if (delta_y != 0
+	  && signbit (delta_y) != signbit (dpyinfo->scroll.acc_y))
+	dpyinfo->scroll.acc_y = 0;
+
+      dpyinfo->scroll.acc_x += delta_x;
+      dpyinfo->scroll.acc_y += delta_y;
+      if (dpyinfo->scroll.acc_y >= dpyinfo->scroll.y_per_line)
 	{
-	  inev.ie.kind = ((fabs (delta_x) > fabs (delta_y))
-			  ? HORIZ_WHEEL_EVENT
-			  : WHEEL_EVENT);
-	  inev.ie.modifiers |= (inev.ie.kind == HORIZ_WHEEL_EVENT
-				? (delta_x >= 0 ? up_modifier : down_modifier)
-				: (delta_y >= 0 ? down_modifier : up_modifier));
-	  inev.ie.arg = list3 (Qnil, make_float (-delta_x * 100),
-			       make_float (-delta_y * 100));
+	  int nlines = dpyinfo->scroll.acc_y / dpyinfo->scroll.y_per_line;
+	  inev.ie.kind = WHEEL_EVENT;
+	  inev.ie.modifiers |= down_modifier;
+	  inev.ie.arg = list3 (make_fixnum (nlines),
+			       make_float (-dpyinfo->scroll.acc_x * 100),
+			       make_float (-dpyinfo->scroll.acc_y * 100));
+	  dpyinfo->scroll.acc_y -= dpyinfo->scroll.y_per_line * nlines;
 	}
-      else
+      else if (dpyinfo->scroll.acc_y <= -dpyinfo->scroll.y_per_line)
 	{
-	  dpyinfo->scroll.acc_x += delta_x;
-	  dpyinfo->scroll.acc_y += delta_y;
-	  if (dpyinfo->scroll.acc_y >= dpyinfo->scroll.y_per_line)
-	    {
-	      int nlines = dpyinfo->scroll.acc_y / dpyinfo->scroll.y_per_line;
-	      inev.ie.kind = WHEEL_EVENT;
-	      inev.ie.modifiers |= down_modifier;
-	      inev.ie.arg = list3 (make_fixnum (nlines),
-				   make_float (-dpyinfo->scroll.acc_x * 100),
-				   make_float (-dpyinfo->scroll.acc_y * 100));
-	      dpyinfo->scroll.acc_y -= dpyinfo->scroll.y_per_line * nlines;
-	    }
-	  else if (dpyinfo->scroll.acc_y <= -dpyinfo->scroll.y_per_line)
-	    {
-	      int nlines = -dpyinfo->scroll.acc_y / dpyinfo->scroll.y_per_line;
-	      inev.ie.kind = WHEEL_EVENT;
-	      inev.ie.modifiers |= up_modifier;
-	      inev.ie.arg = list3 (make_fixnum (nlines),
-				   make_float (-dpyinfo->scroll.acc_x * 100),
-				   make_float (-dpyinfo->scroll.acc_y * 100));
+	  int nlines = -dpyinfo->scroll.acc_y / dpyinfo->scroll.y_per_line;
+	  inev.ie.kind = WHEEL_EVENT;
+	  inev.ie.modifiers |= up_modifier;
+	  inev.ie.arg = list3 (make_fixnum (nlines),
+			       make_float (-dpyinfo->scroll.acc_x * 100),
+			       make_float (-dpyinfo->scroll.acc_y * 100));
 
-	      dpyinfo->scroll.acc_y -= -dpyinfo->scroll.y_per_line * nlines;
-	    }
-	  else if (dpyinfo->scroll.acc_x >= dpyinfo->scroll.x_per_char)
-	    {
-	      int nchars = dpyinfo->scroll.acc_x / dpyinfo->scroll.x_per_char;
-	      inev.ie.kind = HORIZ_WHEEL_EVENT;
-	      inev.ie.modifiers |= up_modifier;
-	      inev.ie.arg = list3 (make_fixnum (nchars),
-				   make_float (-dpyinfo->scroll.acc_x * 100),
-				   make_float (-dpyinfo->scroll.acc_y * 100));
+	  dpyinfo->scroll.acc_y -= -dpyinfo->scroll.y_per_line * nlines;
+	}
+      else if (dpyinfo->scroll.acc_x >= dpyinfo->scroll.x_per_char)
+	{
+	  int nchars = dpyinfo->scroll.acc_x / dpyinfo->scroll.x_per_char;
+	  inev.ie.kind = HORIZ_WHEEL_EVENT;
+	  inev.ie.modifiers |= up_modifier;
+	  inev.ie.arg = list3 (make_fixnum (nchars),
+			       make_float (-dpyinfo->scroll.acc_x * 100),
+			       make_float (-dpyinfo->scroll.acc_y * 100));
 
-	      dpyinfo->scroll.acc_x -= dpyinfo->scroll.x_per_char * nchars;
-	    }
-	  else if (dpyinfo->scroll.acc_x <= -dpyinfo->scroll.x_per_char)
-	    {
-	      int nchars = -dpyinfo->scroll.acc_x / dpyinfo->scroll.x_per_char;
-	      inev.ie.kind = HORIZ_WHEEL_EVENT;
-	      inev.ie.modifiers |= down_modifier;
-	      inev.ie.arg = list3 (make_fixnum (nchars),
-				   make_float (-dpyinfo->scroll.acc_x * 100),
-				   make_float (-dpyinfo->scroll.acc_y * 100));
+	  dpyinfo->scroll.acc_x -= dpyinfo->scroll.x_per_char * nchars;
+	}
+      else if (dpyinfo->scroll.acc_x <= -dpyinfo->scroll.x_per_char)
+	{
+	  int nchars = -dpyinfo->scroll.acc_x / dpyinfo->scroll.x_per_char;
+	  inev.ie.kind = HORIZ_WHEEL_EVENT;
+	  inev.ie.modifiers |= down_modifier;
+	  inev.ie.arg = list3 (make_fixnum (nchars),
+			       make_float (-dpyinfo->scroll.acc_x * 100),
+			       make_float (-dpyinfo->scroll.acc_y * 100));
 
-	      dpyinfo->scroll.acc_x -= -dpyinfo->scroll.x_per_char * nchars;
-	    }
+	  dpyinfo->scroll.acc_x -= -dpyinfo->scroll.x_per_char * nchars;
 	}
     }
 
@@ -9816,6 +9883,13 @@ If set to a non-float value, there will be no wait at all.  */);
   DEFSYM (Qpgtk__frame_resolution_changed,
 	  "pgtk--frame-resolution-changed");
   defsubr (&Spgtk_frame_resolution);
+
+  DEFVAR_LISP ("pgtk-scroll-event-delta-factor",
+	       Vpgtk_scroll_event_delta_factor,
+    doc: /* A scale to apply to pixel deltas reported in scroll events.
+Scroll events only report pixel deltas when `mwheel-coalesce-scroll-events'
+is nil, as `pixel-scroll-precision-mode' makes it.  */);
+  Vpgtk_scroll_event_delta_factor = make_float (1.0);
 #endif
 
   /* Tell Emacs about this window system.  */
