@@ -8254,7 +8254,7 @@ pgtk_scroll (struct frame *frame, GdkEvent *event)
   struct frame *f;
   struct pgtk_display_info *dpyinfo = FRAME_DISPLAY_INFO (frame);
   GdkScrollDirection dir;
-  double delta_x, delta_y;
+  double delta_x, delta_y, clicks;
   bool wheel;
   int x, y;
 
@@ -8289,6 +8289,9 @@ pgtk_scroll (struct frame *frame, GdkEvent *event)
   dir = gdk_scroll_event_get_direction (event);
   gdk_scroll_event_get_deltas (event, &delta_x, &delta_y);
   wheel = gdk_scroll_event_get_unit (event) == GDK_SCROLL_UNIT_WHEEL;
+  clicks = ((NUMBERP (Vpgtk_wheel_clicks_per_detent)
+	     && XFLOATINT (Vpgtk_wheel_clicks_per_detent) > 0)
+	    ? XFLOATINT (Vpgtk_wheel_clicks_per_detent) : 1);
 
   /* Mouse wheels report how many detents they turned, which can be a
      fraction of one for high resolution wheels.  Older compositors
@@ -8312,6 +8315,14 @@ pgtk_scroll (struct frame *frame, GdkEvent *event)
 	break;
       }
 
+  /* Forget what was left over from scrolling the other way.  */
+  if (delta_x != 0
+      && signbit (delta_x) != signbit (dpyinfo->scroll.acc_x))
+    dpyinfo->scroll.acc_x = 0;
+  if (delta_y != 0
+      && signbit (delta_y) != signbit (dpyinfo->scroll.acc_y))
+    dpyinfo->scroll.acc_y = 0;
+
   if (!mwheel_coalesce_scroll_events)
     {
       /* Report the distance to scroll in frame pixels.  Like GTK,
@@ -8320,9 +8331,14 @@ pgtk_scroll (struct frame *frame, GdkEvent *event)
 	 touchpad exactly.  */
       double scale = FRAME_GTK_SCALE (f);
       double unit = scale;
+      Lisp_Object lines = Qnil;
 
       if (wheel)
 	{
+	  bool horizontal = fabs (delta_x) > fabs (delta_y);
+	  double *acc = (horizontal
+			 ? &dpyinfo->scroll.acc_x : &dpyinfo->scroll.acc_y);
+	  double steps;
 	  Lisp_Object window
 	    = window_from_coordinates (f, x, y, NULL, false, false, false);
 	  double height = (WINDOWP (window)
@@ -8330,6 +8346,16 @@ pgtk_scroll (struct frame *frame, GdkEvent *event)
 			   : FRAME_PIXEL_HEIGHT (f));
 
 	  unit = pow (height / scale, 2.0 / 3.0) * scale;
+
+	  /* Also report how many clicks the wheel completed, like the
+	     line count of coalesced events, so that programs which act
+	     once per click, like terminals forwarding wheel presses,
+	     aren't swamped by high resolution wheels.  It is 0 for a
+	     fraction of a click.  */
+	  *acc += (horizontal ? delta_x : delta_y) * clicks;
+	  steps = trunc (*acc);
+	  *acc -= steps;
+	  lines = make_fixnum ((EMACS_INT) fabs (steps));
 	}
 
       if (NUMBERP (Vpgtk_scroll_event_delta_factor))
@@ -8347,7 +8373,7 @@ pgtk_scroll (struct frame *frame, GdkEvent *event)
       inev.ie.modifiers |= (inev.ie.kind == HORIZ_WHEEL_EVENT
 			    ? (delta_x >= 0 ? up_modifier : down_modifier)
 			    : (delta_y >= 0 ? down_modifier : up_modifier));
-      inev.ie.arg = list3 (Qnil, make_float (-delta_x),
+      inev.ie.arg = list3 (lines, make_float (-delta_x),
 			   make_float (-delta_y));
     }
   else
@@ -8356,19 +8382,16 @@ pgtk_scroll (struct frame *frame, GdkEvent *event)
 	 detent counted as one, and ten pixels of touchpad movement
 	 did.  High resolution wheels must not scroll a line for every
 	 fraction of a detent.  */
-      if (!wheel)
+      if (wheel)
+	{
+	  delta_x *= clicks;
+	  delta_y *= clicks;
+	}
+      else
 	{
 	  delta_x /= 10;
 	  delta_y /= 10;
 	}
-
-      /* Forget what was left over from scrolling the other way.  */
-      if (delta_x != 0
-	  && signbit (delta_x) != signbit (dpyinfo->scroll.acc_x))
-	dpyinfo->scroll.acc_x = 0;
-      if (delta_y != 0
-	  && signbit (delta_y) != signbit (dpyinfo->scroll.acc_y))
-	dpyinfo->scroll.acc_y = 0;
 
       dpyinfo->scroll.acc_x += delta_x;
       dpyinfo->scroll.acc_y += delta_y;
@@ -9890,6 +9913,15 @@ If set to a non-float value, there will be no wait at all.  */);
 Scroll events only report pixel deltas when `mwheel-coalesce-scroll-events'
 is nil, as `pixel-scroll-precision-mode' makes it.  */);
   Vpgtk_scroll_event_delta_factor = make_float (1.0);
+
+  DEFVAR_LISP ("pgtk-wheel-clicks-per-detent", Vpgtk_wheel_clicks_per_detent,
+    doc: /* How many wheel clicks a detent of a mouse wheel counts as.
+With a value of 2, Emacs reports a click for every half detent that a
+high resolution wheel turns, which scrolls more often by lines, and,
+with `mwheel-coalesce-scroll-events' nil, makes the line count of
+wheel events count halves of detents.  The distance scrolled by pixels
+does not change.  */);
+  Vpgtk_wheel_clicks_per_detent = make_fixnum (1);
 #endif
 
   /* Tell Emacs about this window system.  */
