@@ -1,3 +1,12 @@
+This is an unofficial fork of GNU Emacs.  Its pure GTK ("pgtk") build
+can use GTK 4 instead of GTK 3 (configure --with-gtk4), which gives
+sharp text and a character grid that fits the font on Wayland desktops
+with fractional scaling.  The GTK 4 code was generated with an AI model
+and is not part of GNU Emacs, so please don't report problems with
+this build to the Emacs developers.  See README-gtk4.md for details.
+The rest of this file is the README of GNU Emacs.
+
+
 Copyright (C) 2001-2026 Free Software Foundation, Inc.
 See the end of the file for license conditions.
 
