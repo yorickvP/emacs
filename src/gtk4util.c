@@ -3158,6 +3158,9 @@ draw_page (GtkPrintOperation *operation, GtkPrintContext *context,
   struct frame *f = XFRAME (Fnth (make_fixnum (page_nr), frames));
   cairo_t *cr = gtk_print_context_get_cairo_context (context);
 
+  /* Print the frame at the size it has on the screen, one logical
+     pixel per point as under GTK 3, not one device pixel.  */
+  cairo_scale (cr, 1 / FRAME_GTK_SCALE (f), 1 / FRAME_GTK_SCALE (f));
   pgtk_cr_draw_frame (cr, f);
 }
 
@@ -3166,6 +3169,11 @@ xg_print_frames_dialog (Lisp_Object frames)
 {
   GtkPrintOperation *print;
   GtkPrintOperationResult res;
+  struct frame *sf = SELECTED_FRAME ();
+  GtkWindow *parent = NULL;
+
+  if (FRAME_PGTK_P (sf) && FRAME_GTK_OUTER_WIDGET (sf))
+    parent = GTK_WINDOW (FRAME_GTK_OUTER_WIDGET (sf));
 
   print = gtk_print_operation_new ();
   if (print_settings != NULL)
@@ -3175,7 +3183,7 @@ xg_print_frames_dialog (Lisp_Object frames)
   gtk_print_operation_set_n_pages (print, list_length (frames));
   g_signal_connect (print, "draw-page", G_CALLBACK (draw_page), &frames);
   res = gtk_print_operation_run (print, GTK_PRINT_OPERATION_ACTION_PRINT_DIALOG,
-                                 NULL, NULL);
+                                 parent, NULL);
   if (res == GTK_PRINT_OPERATION_RESULT_APPLY)
     {
       if (print_settings != NULL)
