@@ -1420,6 +1420,11 @@ pgtk_set_parent_frame (struct frame *f, Lisp_Object new_value,
 
 	if (FRAME_GTK_OUTER_WIDGET (f))
 	  {
+	    /* Forget that the edit widget had the focus in its own
+	       window, lest destroying that window tell its new
+	       ancestors that they lost the focus.  */
+	    gtk_window_set_focus (GTK_WINDOW (FRAME_GTK_OUTER_WIDGET (f)),
+				  NULL);
 	    gtk_box_remove (GTK_BOX (parent), fixed);
 	    free_frame_tool_bar (f);
 	    g_clear_object (&FRAME_OUTPUT_DATA (f)->toolbar_widget);

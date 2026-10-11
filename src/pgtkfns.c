@@ -1762,6 +1762,10 @@ DEFUN ("x-create-frame", Fx_create_frame, Sx_create_frame, 1, 1, 0,
 
       gtk_widget_destroy (FRAME_GTK_OUTER_WIDGET (f));
 #else
+      /* Forget that the edit widget had the focus in its own window
+	 before moving it, lest destroying that window tell the edit
+	 widget of P that it lost the focus.  */
+      gtk_window_set_focus (GTK_WINDOW (FRAME_GTK_OUTER_WIDGET (f)), NULL);
       gtk_box_remove (GTK_BOX (whbox_of_f), fixed);
       emacs_fixed_put (fixed_of_p, fixed,
 		       PGTK_TO_LOGICAL (p, f->left_pos),
