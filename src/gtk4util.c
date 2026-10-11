@@ -1,21 +1,25 @@
 /* Functions for creating and updating GTK 4 widgets.
 
-Copyright (C) 2026 Free Software Foundation, Inc.
+This file was generated with an AI model (Claude) in 2026 for an
+unofficial GTK 4 fork of GNU Emacs.  It is not part of GNU Emacs, and
+its copyright, if any, has not been assigned to the Free Software
+Foundation; see README-gtk4.md.
 
-This file is part of GNU Emacs.
+Parts of it are copied or adapted from gtkutil.c of GNU Emacs:
+Copyright (C) 2003-2026 Free Software Foundation, Inc.
 
-GNU Emacs is free software: you can redistribute it and/or modify
+This file is free software: you can redistribute it and/or modify
 it under the terms of the GNU General Public License as published by
 the Free Software Foundation, either version 3 of the License, or (at
 your option) any later version.
 
-GNU Emacs is distributed in the hope that it will be useful,
+This file is distributed in the hope that it will be useful,
 but WITHOUT ANY WARRANTY; without even the implied warranty of
 MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 GNU General Public License for more details.
 
 You should have received a copy of the GNU General Public License
-along with GNU Emacs.  If not, see <https://www.gnu.org/licenses/>.  */
+along with this file.  If not, see <https://www.gnu.org/licenses/>.  */
 
 /* This file implements the toolkit interface declared in gtkutil.h
    for the pure GTK (pgtk) port built with GTK 4; it takes the place of
