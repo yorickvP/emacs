@@ -652,8 +652,10 @@ pgtk_free_frame_resources (struct frame *f)
   gtk_widget_destroy (FRAME_WIDGET (f));
 #else
   /* Make sure the edit widget no longer refers to F, in case GTK still
-     holds a reference to it.  */
-  emacs_fixed_set_frame (FRAME_GTK_WIDGET (f), NULL);
+     holds a reference to it.  It does not exist yet if creating F
+     failed early, for example because of an invalid font.  */
+  if (FRAME_GTK_WIDGET (f))
+    emacs_fixed_set_frame (FRAME_GTK_WIDGET (f), NULL);
 
   if (FRAME_X_OUTPUT (f)->tip_popover)
     {
@@ -670,7 +672,8 @@ pgtk_free_frame_resources (struct frame *f)
       g_clear_object (&FRAME_X_OUTPUT (f)->toolbar_widget);
       gtk_window_destroy (GTK_WINDOW (FRAME_GTK_OUTER_WIDGET (f)));
     }
-  else if (gtk_widget_get_parent (FRAME_GTK_WIDGET (f)))
+  else if (FRAME_GTK_WIDGET (f)
+	   && gtk_widget_get_parent (FRAME_GTK_WIDGET (f)))
     /* A child frame.  */
     gtk_widget_unparent (FRAME_GTK_WIDGET (f));
 
