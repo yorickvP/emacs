@@ -543,10 +543,26 @@ struct pgtk_output
      in logical pixels.  */
   double scale;
 
-  /* A texture holding the contents of the visible Cairo surface,
-     created on demand when the edit widget is snapshotted and
-     discarded whenever the surface changes.  */
-  GdkTexture *texture;
+  /* The parts of the visible Cairo surface drawn since the frame was
+     last displayed, in device pixels, or NULL if none were.  */
+  cairo_region_t *damage;
+
+  /* How deeply calls to pgtk_begin_cr_clip are nested, and a bit for
+     each of the first 32 levels whose damage was noted explicitly.  */
+  int cr_clip_depth;
+  unsigned int cr_clip_noted;
+
+  /* The surface the frame was last displayed from, its pixels, and
+     textures showing tiles of it.  Only the textures of tiles that
+     were drawn on are replaced, so GTK only uploads those.  */
+  cairo_surface_t *tile_surface;
+  GBytes *tile_bytes;
+  GdkTexture **tiles;
+  int tile_columns, tile_rows;
+
+  /* A copy of the pixels last displayed, for checking that all drawing
+     was noted as damage; see pgtk_update_tiles.  */
+  unsigned char *damage_check;
 
   /* The popover used to display this frame if it is a tooltip
      frame.  */
@@ -768,6 +784,10 @@ extern void pgtk_set_z_group (struct frame *, Lisp_Object, Lisp_Object);
 extern void pgtk_cr_update_surface_desired_size (struct frame *, int, int, bool);
 extern cairo_t *pgtk_begin_cr_clip (struct frame *);
 extern void pgtk_end_cr_clip (struct frame *);
+#ifdef HAVE_GTK4
+extern void pgtk_note_damage (struct frame *, int, int, int, int);
+extern void pgtk_note_glyph_string_damage (struct glyph_string *, cairo_t *);
+#endif
 extern void pgtk_set_cr_source_with_gc_foreground (struct frame *, Emacs_GC *, bool);
 extern void pgtk_set_cr_source_with_gc_background (struct frame *, Emacs_GC *, bool);
 extern void pgtk_set_cr_source_with_color (struct frame *, unsigned long, bool);

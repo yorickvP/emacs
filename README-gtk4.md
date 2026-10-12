@@ -108,8 +108,10 @@ makes it send one press per click instead:
   it is).
 * Keyboard shortcuts in menus are shown in the item's label, since GTK
   4 menus only show one shortcut per item in their own column.
-* Every redisplay uploads the whole frame to the GPU, which might be
-  slow for large frames on slow GPUs.
+* Emacs draws frames on the CPU.  Only the 256-pixel tiles of a frame
+  that changed are handed to the GPU again, so typing and moving the
+  cursor are cheap, but scrolling or switching buffers in a large
+  frame still means uploading most of it.
 
 ## When Emacs crashes
 
@@ -131,6 +133,12 @@ To get a full backtrace, run Emacs in GDB, and type `bt` at the
     gdb -ex run --args ./result/bin/emacs
 
 ## Where the code is
+
+To check that redisplay tells the GTK 4 code about everything it draws
+(otherwise parts of the frame would not be updated on the screen),
+run Emacs with `EMACS_GTK4_CHECK_DAMAGE=1` in the environment: it then
+reports parts of frames that changed without being noted, on standard
+error.  This is slow.
 
 The GTK 4 code is mostly in `src/gtk4util.c`, the GTK 4 counterpart of
 `src/gtkutil.c`, and in the `HAVE_GTK4` parts of `src/pgtkterm.c`,

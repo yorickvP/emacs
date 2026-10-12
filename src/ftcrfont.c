@@ -565,6 +565,9 @@ ftcrfont_draw (struct glyph_string *s,
   cr = x_begin_cr_clip (f, s->gc);
 #else
   cr = pgtk_begin_cr_clip (f);
+#ifdef HAVE_GTK4
+  pgtk_note_glyph_string_damage (s, cr);
+#endif
 #endif
 #else
   /* Presumably the draw lock is already held by

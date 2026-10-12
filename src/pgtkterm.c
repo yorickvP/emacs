@@ -134,6 +134,22 @@ static GdkDragAction current_drop_source_actions;
 static guint32 current_drop_time;
 
 static void pgtk_delete_display (struct pgtk_display_info *);
+#ifdef HAVE_GTK4
+static void pgtk_clear_tiles (struct pgtk_output *);
+/* Note the damage done by the current drawing operation; see
+   pgtk_note_damage.  NOTE_NO_DAMAGE notes that it draws nothing itself,
+   only by calling functions that note their own damage.  */
+#define NOTE_DAMAGE(f, x, y, width, height)	\
+  pgtk_note_damage (f, x, y, width, height)
+#else
+#define NOTE_DAMAGE(f, x, y, width, height) ((void) 0)
+#endif
+#define NOTE_NO_DAMAGE(f) NOTE_DAMAGE (f, 0, 0, 0, 0)
+#ifdef HAVE_GTK4
+#define NOTE_GLYPH_STRING_DAMAGE(s, cr) pgtk_note_glyph_string_damage (s, cr)
+#else
+#define NOTE_GLYPH_STRING_DAMAGE(s, cr) ((void) 0)
+#endif
 static void pgtk_new_focus_frame (struct pgtk_display_info *, struct frame *);
 static void pgtk_clear_frame_area (struct frame *, int, int, int, int);
 static void pgtk_fill_rectangle (struct frame *, unsigned long, int, int,
@@ -350,9 +366,6 @@ flip_cr_context (struct frame *f)
 
       FRAME_CR_ACTIVE_CONTEXT (f)
 	= cairo_reference (FRAME_CR_CONTEXT (f));
-#ifdef HAVE_GTK4
-      g_clear_object (&FRAME_X_OUTPUT (f)->texture);
-#endif
     }
   unblock_input ();
 }
@@ -669,7 +682,8 @@ pgtk_free_frame_resources (struct frame *f)
     }
 
 #ifdef HAVE_GTK4
-  g_clear_object (&FRAME_X_OUTPUT (f)->texture);
+  pgtk_clear_tiles (FRAME_X_OUTPUT (f));
+  g_clear_pointer (&FRAME_X_OUTPUT (f)->damage, cairo_region_destroy);
 #endif
 
   if (FRAME_X_OUTPUT (f)->scrollbar_foreground_css_provider != NULL)
@@ -1932,6 +1946,7 @@ pgtk_draw_rectangle (struct frame *f, unsigned long color, int x, int y,
   cairo_t *cr;
 
   cr = pgtk_begin_cr_clip (f);
+  NOTE_DAMAGE (f, x, y, width + 1, height + 1);
   pgtk_set_cr_source_with_color (f, color, respect_alpha_background);
   cairo_rectangle (cr, x + 0.5, y + 0.5, width, height);
   cairo_set_line_width (cr, 1);
@@ -2712,6 +2727,7 @@ pgtk_cr_draw_image (struct frame *f, Emacs_GC *gc, cairo_pattern_t *image,
 {
   cairo_t *cr = pgtk_begin_cr_clip (f);
 
+  NOTE_DAMAGE (f, dest_x, dest_y, width, height);
   if (overlay_p)
     cairo_rectangle (cr, dest_x, dest_y, width, height);
   else
@@ -2767,6 +2783,7 @@ pgtk_draw_image_foreground (struct glyph_string *s)
     {
       cairo_t *cr = pgtk_begin_cr_clip (s->f);
       pgtk_set_glyph_string_clipping (s, cr);
+      NOTE_GLYPH_STRING_DAMAGE (s, cr);
       pgtk_cr_draw_image (s->f, &s->xgcv, s->img->cr_data,
 			  s->slice.x, s->slice.y, s->slice.width, s->slice.height,
 			  x, y, true);
@@ -3045,6 +3062,7 @@ pgtk_draw_glyph_string (struct glyph_string *s)
 	    cairo_t *cr = pgtk_begin_cr_clip (next->f);
 	    pgtk_set_glyph_string_gc (next);
 	    pgtk_set_glyph_string_clipping (next, cr);
+	    NOTE_GLYPH_STRING_DAMAGE (next, cr);
 	    if (next->first_glyph->type == STRETCH_GLYPH)
 	      pgtk_draw_stretch_glyph_string (next);
 	    else
@@ -3083,6 +3101,8 @@ pgtk_draw_glyph_string (struct glyph_string *s)
     pgtk_set_glyph_string_clipping_exactly (s, s, cr);
   else
     pgtk_set_glyph_string_clipping (s, cr);
+
+  NOTE_GLYPH_STRING_DAMAGE (s, cr);
 
   switch (s->first_glyph->type)
     {
@@ -3419,6 +3439,7 @@ pgtk_draw_hollow_cursor (struct window *w, struct glyph_row *row)
     }
   /* Set clipping, draw the rectangle, and reset clipping again.  */
   pgtk_clip_to_row (w, row, TEXT_AREA, cr);
+  NOTE_NO_DAMAGE (f);
   pgtk_draw_rectangle (f, FRAME_X_OUTPUT (f)->cursor_color,
 		       x, y, wd, h - 1, false);
   pgtk_end_cr_clip (f);
@@ -3476,6 +3497,7 @@ pgtk_draw_bar_cursor (struct window *w, struct glyph_row *row, int width,
 	color = FRAME_X_OUTPUT (f)->cursor_color;
 
       pgtk_clip_to_row (w, row, TEXT_AREA, cr);
+      NOTE_NO_DAMAGE (f);
 
       if (kind == BAR_CURSOR)
 	{
@@ -3880,6 +3902,7 @@ pgtk_draw_vertical_window_border (struct window *w, int x, int y0, int y1)
   cairo_t *cr;
 
   cr = pgtk_begin_cr_clip (f);
+  NOTE_DAMAGE (f, x, y0, 1, y1 - y0);
 
   face = FACE_FROM_ID_OR_NULL (f, VERTICAL_BORDER_FACE_ID);
   if (face)
@@ -3910,6 +3933,7 @@ pgtk_draw_window_divider (struct window *w, int x0, int x1, int y0, int y1)
 			      ? face_last->foreground
 			      : FRAME_FOREGROUND_PIXEL (f));
   cairo_t *cr = pgtk_begin_cr_clip (f);
+  NOTE_DAMAGE (f, x0, y0, x1 - x0, y1 - y0);
 
   if (y1 - y0 > x1 - x0 && x1 - x0 > 2)
     /* Vertical.  */
@@ -4228,6 +4252,9 @@ pgtk_draw_fringe_bitmap (struct window *w, struct glyph_row *row,
   /* Must clip because of partially visible lines.  */
   pgtk_clip_to_row (w, row, ANY_AREA, cr);
 
+  /* All drawing is done by the functions called below.  */
+  NOTE_NO_DAMAGE (f);
+
   if (p->bx >= 0 && !p->overlay_p)
     fill_background_by_face (f, face, p->bx, p->by, p->nx, p->ny);
 
@@ -4334,11 +4361,15 @@ static void
 pgtk_flush_display (struct frame *f)
 {
 #ifdef HAVE_GTK4
-  /* The contents of the frame are copied to a texture when the edit
-     widget is drawn, so make sure that happens if anything was drawn
-     outside a normal redisplay.  */
-  if (!FRAME_X_OUTPUT (f)->texture && FRAME_GTK_WIDGET (f)
-      && !buffer_flipping_blocked_p ())
+  /* The edit widget shows the contents of the frame as of when it
+     was last drawn, so draw it again if anything was drawn since, or
+     the frame is now displayed from another surface.  */
+  struct pgtk_output *x = FRAME_X_OUTPUT (f);
+
+  if ((x->damage
+       || (FRAME_CR_ACTIVE_CONTEXT (f)
+	   && cairo_get_target (FRAME_CR_ACTIVE_CONTEXT (f)) != x->tile_surface))
+      && FRAME_GTK_WIDGET (f) && !buffer_flipping_blocked_p ())
     gtk_widget_queue_draw (FRAME_GTK_WIDGET (f));
 #endif
 }
@@ -5741,6 +5772,7 @@ pgtk_fill_rectangle (struct frame *f, unsigned long color, int x, int y,
 {
   cairo_t *cr;
   cr = pgtk_begin_cr_clip (f);
+  NOTE_DAMAGE (f, x, y, width, height);
   pgtk_set_cr_source_with_color (f, color, respect_alpha_background);
   cairo_rectangle (cr, x, y, width, height);
   cairo_fill (cr);
@@ -7646,6 +7678,222 @@ pgtk_set_event_handler (struct frame *f)
    delivered to, in logical pixels; pgtk_surface_to_frame_coords
    converts them to Emacs pixels.  */
 
+/* Frames are displayed from textures showing square tiles of their
+   Cairo surfaces, this many device pixels wide.  When part of a frame
+   is drawn on, only the textures of the tiles it touches are replaced,
+   so GTK only uploads those tiles to the GPU.  The textures share the
+   pixels of the surface instead of copying them.  That is safe even
+   though they are meant to be immutable: Emacs only draws on the
+   surface between displaying frames, and the textures of the tiles it
+   draws on are replaced before GTK displays the frame again.  */
+
+#define PGTK_TILE_SIZE 256
+
+/* Whether to check that all drawing is noted as damage, by comparing
+   the pixels of each frame with those it was last displayed with.  Set
+   by the environment variable EMACS_GTK4_CHECK_DAMAGE.  */
+static int pgtk_check_damage = -1;
+
+/* Add the rectangle X, Y, WIDTH, HEIGHT of frame F, in device pixels,
+   to what is to be displayed again.  */
+
+static void
+pgtk_add_damage (struct frame *f, int x, int y, int width, int height)
+{
+  struct pgtk_output *out = FRAME_X_OUTPUT (f);
+
+  if (width <= 0 || height <= 0)
+    return;
+
+  if (!out->damage)
+    out->damage = cairo_region_create ();
+  cairo_region_union_rectangle (out->damage,
+				&(cairo_rectangle_int_t) { x, y,
+							   width, height });
+}
+
+/* Note that the current drawing operation on frame F, between calls to
+   pgtk_begin_cr_clip and pgtk_end_cr_clip, draws on the rectangle X,
+   Y, WIDTH, HEIGHT, in device pixels.  Operations that don't note
+   their damage are taken to damage their whole clip region, which
+   can be much larger.  */
+
+void
+pgtk_note_damage (struct frame *f, int x, int y, int width, int height)
+{
+  struct pgtk_output *out = FRAME_X_OUTPUT (f);
+
+  pgtk_add_damage (f, x, y, width, height);
+  if (out->cr_clip_depth > 0 && out->cr_clip_depth <= 32)
+    out->cr_clip_noted |= 1u << (out->cr_clip_depth - 1);
+}
+
+/* Note that the current drawing operation on frame F, drawing with CR,
+   damaged the extents of its clip region.  */
+
+static void
+pgtk_note_clip_damage (struct frame *f, cairo_t *cr)
+{
+  double x1, y1, x2, y2;
+
+  /* The clip extents are in user space; this is about to be undone by
+     cairo_restore anyway.  */
+  cairo_identity_matrix (cr);
+  cairo_clip_extents (cr, &x1, &y1, &x2, &y2);
+  pgtk_add_damage (f, floor (x1), floor (y1),
+		   ceil (x2) - floor (x1), ceil (y2) - floor (y1));
+}
+
+/* Note the damage done by drawing glyph string S with CR: the part
+   of its clip region that S covers.  Glyph strings are clipped to the
+   whole width of their row, which is far more than S usually draws
+   on.  */
+
+void
+pgtk_note_glyph_string_damage (struct glyph_string *s, cairo_t *cr)
+{
+  cairo_matrix_t matrix;
+  double x1, y1, x2, y2;
+  /* Glyphs can overhang S, and antialiasing can spill over a pixel.  */
+  int left = s->x - max (0, s->left_overhang) - 1;
+  int right = (s->x + max (s->width, s->background_width)
+	       + max (0, s->right_overhang) + 1);
+
+  cairo_get_matrix (cr, &matrix);
+  cairo_identity_matrix (cr);
+  cairo_clip_extents (cr, &x1, &y1, &x2, &y2);
+  cairo_set_matrix (cr, &matrix);
+
+  left = max (left, (int) floor (x1));
+  right = min (right, (int) ceil (x2));
+  pgtk_note_damage (s->f, left, floor (y1), right - left,
+		    ceil (y2) - floor (y1));
+}
+
+/* Forget the tiles of the frame with output data X.  */
+
+static void
+pgtk_clear_tiles (struct pgtk_output *x)
+{
+  int i;
+
+  if (x->tiles)
+    for (i = 0; i < x->tile_columns * x->tile_rows; i++)
+      g_clear_object (&x->tiles[i]);
+  g_clear_pointer (&x->tiles, g_free);
+  g_clear_pointer (&x->tile_bytes, g_bytes_unref);
+  g_clear_pointer (&x->tile_surface, cairo_surface_destroy);
+  g_clear_pointer (&x->damage_check, g_free);
+  x->tile_columns = x->tile_rows = 0;
+}
+
+/* Make the texture showing the tile in column COL and row ROW of the
+   frame with output data X.  */
+
+static GdkTexture *
+pgtk_make_tile (struct pgtk_output *x, int col, int row)
+{
+  int width = cairo_image_surface_get_width (x->tile_surface);
+  int height = cairo_image_surface_get_height (x->tile_surface);
+  int stride = cairo_image_surface_get_stride (x->tile_surface);
+  int tx = col * PGTK_TILE_SIZE, ty = row * PGTK_TILE_SIZE;
+  int tw = min (PGTK_TILE_SIZE, width - tx);
+  int th = min (PGTK_TILE_SIZE, height - ty);
+  GBytes *bytes;
+  GdkTexture *texture;
+
+  bytes = g_bytes_new_from_bytes (x->tile_bytes,
+				  (gsize) ty * stride + (gsize) tx * 4,
+				  (gsize) (th - 1) * stride + (gsize) tw * 4);
+  texture = gdk_memory_texture_new (tw, th, GDK_MEMORY_DEFAULT, bytes,
+				    stride);
+  g_bytes_unref (bytes);
+  return texture;
+}
+
+/* Bring the textures of the tiles of frame F up to date with its
+   surface SRC, an ARGB32 image surface, and forget its damage.  */
+
+static void
+pgtk_update_tiles (struct frame *f, cairo_surface_t *src)
+{
+  struct pgtk_output *x = FRAME_X_OUTPUT (f);
+  int width = cairo_image_surface_get_width (src);
+  int height = cairo_image_surface_get_height (src);
+  int stride = cairo_image_surface_get_stride (src);
+  unsigned char *data;
+  int col, row;
+
+  if (pgtk_check_damage < 0)
+    pgtk_check_damage = getenv ("EMACS_GTK4_CHECK_DAMAGE") != NULL;
+
+  cairo_surface_flush (src);
+  data = cairo_image_surface_get_data (src);
+
+  /* Start over when the frame is displayed from a different surface,
+     as after it was resized.  */
+  if (src != x->tile_surface)
+    {
+      pgtk_clear_tiles (x);
+      x->tile_surface = cairo_surface_reference (src);
+      x->tile_bytes
+	= g_bytes_new_with_free_func (data, (gsize) stride * height,
+				      (GDestroyNotify) cairo_surface_destroy,
+				      cairo_surface_reference (src));
+      x->tile_columns = (width + PGTK_TILE_SIZE - 1) / PGTK_TILE_SIZE;
+      x->tile_rows = (height + PGTK_TILE_SIZE - 1) / PGTK_TILE_SIZE;
+      x->tiles = g_new0 (GdkTexture *, x->tile_columns * x->tile_rows);
+    }
+
+  for (row = 0; row < x->tile_rows; row++)
+    for (col = 0; col < x->tile_columns; col++)
+      {
+	GdkTexture **tile = &x->tiles[row * x->tile_columns + col];
+	cairo_rectangle_int_t rect
+	  = { col * PGTK_TILE_SIZE, row * PGTK_TILE_SIZE,
+	      min (PGTK_TILE_SIZE, width - col * PGTK_TILE_SIZE),
+	      min (PGTK_TILE_SIZE, height - row * PGTK_TILE_SIZE) };
+	bool damaged
+	  = (x->damage
+	     && (cairo_region_contains_rectangle (x->damage, &rect)
+		 != CAIRO_REGION_OVERLAP_OUT));
+
+	if (*tile && !damaged && x->damage_check)
+	  {
+	    /* Check that nothing was drawn on this tile without
+	       noting it.  */
+	    int y;
+
+	    for (y = rect.y; y < rect.y + rect.height; y++)
+	      if (memcmp (data + (gsize) y * stride + rect.x * 4,
+			  x->damage_check + (gsize) y * stride + rect.x * 4,
+			  rect.width * 4))
+		{
+		  fprintf (stderr, "Emacs: undamaged change in tile %d,%d"
+			   " (%dx%d+%d+%d)\n", col, row, rect.width,
+			   rect.height, rect.x, rect.y);
+		  damaged = true;
+		  break;
+		}
+	  }
+
+	if (!*tile || damaged)
+	  {
+	    g_clear_object (tile);
+	    *tile = pgtk_make_tile (x, col, row);
+	  }
+      }
+
+  g_clear_pointer (&x->damage, cairo_region_destroy);
+
+  if (pgtk_check_damage)
+    {
+      if (!x->damage_check)
+	x->damage_check = g_malloc ((gsize) stride * height);
+      memcpy (x->damage_check, data, (gsize) stride * height);
+    }
+}
+
 /* Draw the contents of frame F, whose edit widget is WIDGET, into
    SNAPSHOT.  */
 
@@ -7655,9 +7903,9 @@ pgtk_snapshot_frame (struct frame *f, GtkWidget *widget,
 {
   struct pgtk_output *x = FRAME_X_OUTPUT (f);
   cairo_surface_t *src = x->cr_surface_visible_bell;
-  GdkTexture *texture;
+  GdkTexture *bell = NULL;
   double scale = FRAME_GTK_SCALE (f);
-  int ox, oy;
+  int ox, oy, col, row;
   graphene_point_t origin;
   GtkNative *native;
   double tx = 0, ty = 0;
@@ -7668,22 +7916,19 @@ pgtk_snapshot_frame (struct frame *f, GtkWidget *widget,
   if (!src)
     return;
 
-  /* The contents of the Cairo surface are copied into a texture,
-     which is kept until something is drawn to the surface.  */
-  if (src == x->cr_surface_visible_bell)
-    texture = xg_texture_from_surface (src);
+  /* The visible bell is shown briefly, so copy it.  */
+  if (src == x->cr_surface_visible_bell
+      || cairo_surface_get_type (src) != CAIRO_SURFACE_TYPE_IMAGE
+      || cairo_image_surface_get_format (src) != CAIRO_FORMAT_ARGB32)
+    bell = xg_texture_from_surface (src);
   else
-    {
-      if (!x->texture)
-	x->texture = xg_texture_from_surface (src);
-      texture = g_object_ref (x->texture);
-    }
+    pgtk_update_tiles (f, src);
 
-  /* Emacs draws in device pixels, so draw the texture at 1/SCALE of
-     its size.  To prevent GTK from resampling it, which would make it
-     blurry, place it so that its pixels coincide with those of the
-     surface: the origin of the widget might fall in the middle of a
-     device pixel.  */
+  /* Emacs draws in device pixels, so draw the textures at 1/SCALE of
+     their size.  To prevent GTK from resampling them, which would make
+     them blurry, place them so that their pixels coincide with those
+     of the surface: the origin of the widget might fall in the middle
+     of a device pixel.  */
   native = gtk_widget_get_native (widget);
   origin = GRAPHENE_POINT_INIT (0, 0);
   if (native)
@@ -7703,12 +7948,28 @@ pgtk_snapshot_frame (struct frame *f, GtkWidget *widget,
 						(float) (oy / scale
 							 - (double) origin.y
 							 - ty)));
-  gtk_snapshot_append_texture (snapshot, texture,
-			       &GRAPHENE_RECT_INIT
-			       (0, 0, gdk_texture_get_width (texture) / scale,
-				gdk_texture_get_height (texture) / scale));
+  if (bell)
+    {
+      gtk_snapshot_append_texture (snapshot, bell,
+				   &GRAPHENE_RECT_INIT
+				   (0, 0, gdk_texture_get_width (bell) / scale,
+				    gdk_texture_get_height (bell) / scale));
+      g_object_unref (bell);
+    }
+  else
+    for (row = 0; row < x->tile_rows; row++)
+      for (col = 0; col < x->tile_columns; col++)
+	{
+	  GdkTexture *tile = x->tiles[row * x->tile_columns + col];
+
+	  gtk_snapshot_append_texture (snapshot, tile,
+				       &GRAPHENE_RECT_INIT
+				       (col * PGTK_TILE_SIZE / scale,
+					row * PGTK_TILE_SIZE / scale,
+					gdk_texture_get_width (tile) / scale,
+					gdk_texture_get_height (tile) / scale));
+	}
   gtk_snapshot_restore (snapshot);
-  g_object_unref (texture);
 }
 
 /* Return the resolution of frame F, in device pixels per inch.  */
@@ -9816,6 +10077,7 @@ pgtk_clear_area (struct frame *f, int x, int y, int width, int height)
   eassert (width > 0 && height > 0);
 
   cr = pgtk_begin_cr_clip (f);
+  NOTE_DAMAGE (f, x, y, width, height);
   pgtk_set_cr_source_with_color (f, FRAME_X_OUTPUT (f)->background_color,
 				 true);
   cairo_rectangle (cr, x, y, width, height);
@@ -9991,9 +10253,13 @@ pgtk_begin_cr_clip (struct frame *f)
     }
 
 #ifdef HAVE_GTK4
-  /* The texture holding the contents of the frame is now stale.  */
-  if (cr == FRAME_CR_ACTIVE_CONTEXT (f))
-    g_clear_object (&FRAME_X_OUTPUT (f)->texture);
+  {
+    struct pgtk_output *x = FRAME_X_OUTPUT (f);
+
+    x->cr_clip_depth++;
+    if (x->cr_clip_depth <= 32)
+      x->cr_clip_noted &= ~(1u << (x->cr_clip_depth - 1));
+  }
 #endif
 
   cairo_save (cr);
@@ -10004,7 +10270,26 @@ pgtk_begin_cr_clip (struct frame *f)
 void
 pgtk_end_cr_clip (struct frame *f)
 {
-  cairo_restore (FRAME_CR_CONTEXT (f));
+  cairo_t *cr = FRAME_CR_CONTEXT (f);
+
+#ifdef HAVE_GTK4
+  struct pgtk_output *x = FRAME_X_OUTPUT (f);
+
+  /* What was drawn must be displayed again.  Unless the operation
+     noted what it drew, that could be anything in its clip region.  */
+  if (x->cr_clip_depth > 0)
+    {
+      unsigned int bit = (x->cr_clip_depth <= 32
+			  ? 1u << (x->cr_clip_depth - 1) : 0);
+
+      if (!(x->cr_clip_noted & bit))
+	pgtk_note_clip_damage (f, cr);
+      x->cr_clip_noted &= ~bit;
+      x->cr_clip_depth--;
+    }
+#endif
+
+  cairo_restore (cr);
 }
 
 void
