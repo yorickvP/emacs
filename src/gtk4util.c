@@ -717,7 +717,9 @@ xg_frame_set_size_and_position (struct frame *f, int width, int height)
 		       5, 0, Qxg_frame_set_char_size);
 }
 
-/* Set the background of widget W to PIXEL.  */
+/* Set the background of widget W to PIXEL, or make it transparent if
+   the background of F is: GTK 4 draws it under the frame's contents,
+   which would then not show what is behind the window.  */
 
 static void
 xg_set_widget_bg (struct frame *f, GtkWidget *w, unsigned long pixel)
@@ -736,8 +738,11 @@ xg_set_widget_bg (struct frame *f, GtkWidget *w, unsigned long pixel)
 			      provider, g_object_unref);
     }
 
-  sprintf (buf, "* { background-color: #%06x; }",
-	   (unsigned int) (pixel & 0xffffff));
+  if (f->alpha_background < 1.0)
+    strcpy (buf, "* { background: none; }");
+  else
+    sprintf (buf, "* { background-color: #%06x; }",
+	     (unsigned int) (pixel & 0xffffff));
   gtk_css_provider_load_from_string (provider, buf);
 }
 
